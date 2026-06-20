@@ -31,3 +31,6 @@ diesel-guard.toml
 
 # mdBook build output
 /docs/book
+
+# Local scratch work and generated reports
+/tmp/
