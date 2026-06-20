@@ -34,3 +34,6 @@ diesel-guard.toml
 
 # Local scratch work and generated reports
 /tmp/
+
+# Local Risk suppressions and analysis settings
+/risk.toml
