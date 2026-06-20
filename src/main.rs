@@ -107,6 +107,12 @@ EXAMPLES:
         #[arg(long)]
         file: Option<Utf8PathBuf>,
     },
+
+    /// Run the stdio Language Server Protocol server
+    #[command(
+        long_about = "Run a stdio Language Server Protocol server for SQL migration diagnostics."
+    )]
+    Lsp,
 }
 
 fn run_check(path: &camino::Utf8Path, format: &str) -> Result<()> {
@@ -231,6 +237,10 @@ fn main() -> Result<()> {
             );
             println!("2. Customize other configuration options as needed");
             println!("3. Run 'diesel-guard check' to check your migrations");
+        }
+
+        Commands::Lsp => {
+            diesel_guard::lsp::run()?;
         }
     }
 

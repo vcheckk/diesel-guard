@@ -21,6 +21,10 @@ clap = { version = "4.6", features = ["derive"] }
 colored = "3.1"
 human-panic = "2"
 
+# Language Server Protocol
+lsp-server = "0.7"
+lsp-types = "0.97"
+
 # Error handling
 thiserror = "2.0"
 

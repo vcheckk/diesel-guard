@@ -4,7 +4,24 @@ use crate::violation::Violation;
 use camino::Utf8Path;
 use pg_query::protobuf::node::Node as NodeEnum;
 use rhai::{AST, Dynamic, Engine};
+use std::io::Read;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+pub const MAX_CUSTOM_CHECK_SOURCE_BYTES: u64 = 64 * 1024;
+pub const MAX_CUSTOM_CHECK_FILES: usize = 512;
+pub const MAX_CUSTOM_CHECK_DIR_ENTRIES: usize = 2_048;
+pub const MAX_CUSTOM_CHECK_TOTAL_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+
+struct CustomCheckFile {
+    path: PathBuf,
+    stem: String,
+}
+
+enum ScriptSource {
+    Source(String, u64),
+    TooLarge,
+}
 
 /// Error encountered while loading or running a custom Rhai check script.
 #[derive(thiserror::Error, Debug)]
@@ -16,9 +33,14 @@ pub struct ScriptError {
 
 /// A custom check backed by a compiled Rhai script.
 pub struct CustomCheck {
-    name: &'static str,
+    name: String,
     engine: Arc<Engine>,
     ast: AST,
+}
+
+pub fn custom_check_names(dir: &Utf8Path) -> Vec<String> {
+    let (files, _errors) = discover_custom_check_files(dir);
+    files.into_iter().map(|file| file.stem).collect()
 }
 
 impl CustomCheck {
@@ -32,8 +54,8 @@ impl CustomCheck {
 }
 
 impl Check for CustomCheck {
-    fn name(&self) -> &'static str {
-        self.name
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn check(&self, node: &NodeEnum, config: &Config, ctx: &MigrationContext) -> Vec<Violation> {
@@ -59,7 +81,7 @@ impl Check for CustomCheck {
             .engine
             .eval_ast_with_scope::<Dynamic>(&mut scope, &self.ast)
         {
-            Ok(result) => parse_script_result(self.name, result),
+            Ok(result) => parse_script_result(&self.name, result),
             Err(e) => {
                 vec![Violation::new(
                     format!("SCRIPT ERROR: {}", self.name),
@@ -225,46 +247,43 @@ pub fn load_custom_checks(
     config: &crate::config::Config,
 ) -> (Vec<Box<dyn Check>>, Vec<ScriptError>) {
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
-    let mut errors: Vec<ScriptError> = Vec::new();
-
     let engine = Arc::new(create_engine());
-
-    let read_dir = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(e) => {
-            errors.push(ScriptError {
-                file: dir.to_string(),
-                message: format!("Failed to read directory: {e}"),
-            });
-            return (checks, errors);
-        }
-    };
-
-    let mut entries: Vec<_> = read_dir
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "rhai"))
-        .collect();
-
-    // Sort for deterministic order
-    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let (entries, mut errors) = discover_custom_check_files(dir);
+    let mut total_source_bytes = 0_u64;
 
     for entry in entries {
-        let path = entry.path();
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
-
         // Skip scripts disabled via config
-        if !config.is_check_enabled(stem) {
+        if !config.is_check_enabled(&entry.stem) {
             continue;
         }
 
-        let source = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
+        let source = match read_script_source(&entry.path) {
+            Ok(ScriptSource::Source(source, bytes_read)) => {
+                let next_total = total_source_bytes.saturating_add(bytes_read);
+                if next_total > MAX_CUSTOM_CHECK_TOTAL_SOURCE_BYTES {
+                    errors.push(ScriptError {
+                        file: dir.to_string(),
+                        message: format!(
+                            "Custom check scripts are larger than {MAX_CUSTOM_CHECK_TOTAL_SOURCE_BYTES} bytes in total"
+                        ),
+                    });
+                    break;
+                }
+                total_source_bytes = next_total;
+                source
+            }
+            Ok(ScriptSource::TooLarge) => {
+                errors.push(ScriptError {
+                    file: entry.path.display().to_string(),
+                    message: format!(
+                        "Custom check script is larger than {MAX_CUSTOM_CHECK_SOURCE_BYTES} bytes"
+                    ),
+                });
+                continue;
+            }
             Err(e) => {
                 errors.push(ScriptError {
-                    file: path.display().to_string(),
+                    file: entry.path.display().to_string(),
                     message: format!("Failed to read: {e}"),
                 });
                 continue;
@@ -273,17 +292,15 @@ pub fn load_custom_checks(
 
         match engine.compile(&source) {
             Ok(ast) => {
-                // Leak the name — finite: one per script at startup
-                let name: &'static str = Box::leak(stem.to_string().into_boxed_str());
                 checks.push(Box::new(CustomCheck {
-                    name,
+                    name: entry.stem,
                     engine: Arc::clone(&engine),
                     ast,
                 }));
             }
             Err(e) => {
                 errors.push(ScriptError {
-                    file: path.display().to_string(),
+                    file: entry.path.display().to_string(),
                     message: format!("Compilation error: {e}"),
                 });
             }
@@ -291,6 +308,99 @@ pub fn load_custom_checks(
     }
 
     (checks, errors)
+}
+
+fn discover_custom_check_files(dir: &Utf8Path) -> (Vec<CustomCheckFile>, Vec<ScriptError>) {
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            errors.push(ScriptError {
+                file: dir.to_string(),
+                message: format!("Failed to read directory: {e}"),
+            });
+            return (files, errors);
+        }
+    };
+
+    for (index, entry) in read_dir.enumerate() {
+        if index >= MAX_CUSTOM_CHECK_DIR_ENTRIES {
+            errors.push(ScriptError {
+                file: dir.to_string(),
+                message: format!(
+                    "Custom checks directory has more than {MAX_CUSTOM_CHECK_DIR_ENTRIES} entries"
+                ),
+            });
+            break;
+        }
+
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                errors.push(ScriptError {
+                    file: dir.to_string(),
+                    message: format!("Failed to read directory entry: {e}"),
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "rhai") {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) => {
+                errors.push(ScriptError {
+                    file: path.display().to_string(),
+                    message: format!("Failed to inspect file type: {e}"),
+                });
+                continue;
+            }
+        };
+        if !file_type.is_file() {
+            errors.push(ScriptError {
+                file: path.display().to_string(),
+                message: "Custom check path is not a regular file".to_string(),
+            });
+            continue;
+        }
+
+        if files.len() >= MAX_CUSTOM_CHECK_FILES {
+            errors.push(ScriptError {
+                file: dir.to_string(),
+                message: format!(
+                    "Custom checks directory has more than {MAX_CUSTOM_CHECK_FILES} .rhai files"
+                ),
+            });
+            break;
+        }
+
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        files.push(CustomCheckFile { path, stem });
+    }
+
+    files.sort_by(|left, right| left.path.file_name().cmp(&right.path.file_name()));
+    (files, errors)
+}
+
+fn read_script_source(path: &std::path::Path) -> std::io::Result<ScriptSource> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = file.take(MAX_CUSTOM_CHECK_SOURCE_BYTES.saturating_add(1));
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    let bytes_read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if bytes_read > MAX_CUSTOM_CHECK_SOURCE_BYTES {
+        return Ok(ScriptSource::TooLarge);
+    }
+    String::from_utf8(bytes)
+        .map(|source| ScriptSource::Source(source, bytes_read))
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
 #[cfg(test)]
@@ -328,8 +438,11 @@ mod tests {
     ) -> Vec<Violation> {
         let engine = Arc::new(create_engine());
         let ast = engine.compile(script).expect("script should compile");
-        let name: &'static str = Box::leak("test_check".to_string().into_boxed_str());
-        let check = CustomCheck { name, engine, ast };
+        let check = CustomCheck {
+            name: "test_check".to_string(),
+            engine,
+            ast,
+        };
 
         let stmts = crate::parser::parse(sql).expect("SQL should parse");
         let mut all_violations = Vec::new();
@@ -690,7 +803,88 @@ mod tests {
 
         assert_eq!(checks.len(), 0);
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].message.contains("Failed to read"));
+        assert!(errors[0].message.contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_custom_checks_rejects_symlink() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let dir_path = Utf8Path::from_path(dir.path()).unwrap();
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("linked.rhai");
+        fs::write(&target, "return;").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let config = crate::config::Config::default();
+        let (checks, errors) = load_custom_checks(dir_path, &config);
+
+        assert_eq!(checks.len(), 0);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("not a regular file"));
+    }
+
+    #[test]
+    fn test_load_custom_checks_rejects_oversized_script() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let dir_path = Utf8Path::from_path(dir.path()).unwrap();
+        let script_path = dir.path().join("too_large.rhai");
+        fs::write(
+            &script_path,
+            " ".repeat(usize::try_from(MAX_CUSTOM_CHECK_SOURCE_BYTES).unwrap() + 1),
+        )
+        .unwrap();
+
+        let config = crate::config::Config::default();
+        let (checks, errors) = load_custom_checks(dir_path, &config);
+
+        assert!(checks.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0]
+                .message
+                .contains("Custom check script is larger than")
+        );
+    }
+
+    #[test]
+    fn test_load_custom_checks_rejects_too_many_scripts() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let dir_path = Utf8Path::from_path(dir.path()).unwrap();
+        for index in 0..=MAX_CUSTOM_CHECK_FILES {
+            fs::write(dir.path().join(format!("check_{index}.rhai")), "return;").unwrap();
+        }
+
+        let config = crate::config::Config::default();
+        let (_checks, errors) = load_custom_checks(dir_path, &config);
+
+        assert!(errors.iter().any(|error| {
+            error
+                .message
+                .contains("Custom checks directory has more than")
+        }));
+    }
+
+    #[test]
+    fn test_load_custom_checks_rejects_total_source_bytes() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let dir_path = Utf8Path::from_path(dir.path()).unwrap();
+        let script = format!(
+            "let x = 1;{}",
+            " ".repeat(usize::try_from(MAX_CUSTOM_CHECK_SOURCE_BYTES).unwrap() - 10)
+        );
+        for index in 0..33 {
+            fs::write(dir.path().join(format!("check_{index}.rhai")), &script).unwrap();
+        }
+
+        let config = crate::config::Config::default();
+        let (_checks, errors) = load_custom_checks(dir_path, &config);
+
+        assert!(errors.iter().any(|error| {
+            error
+                .message
+                .contains("Custom check scripts are larger than")
+        }));
     }
 
     #[test]
@@ -746,8 +940,11 @@ mod tests {
     fn make_test_check() -> CustomCheck {
         let engine = Arc::new(create_engine());
         let ast = engine.compile("()").expect("script should compile");
-        let name: &'static str = Box::leak("test_check".to_string().into_boxed_str());
-        CustomCheck { name, engine, ast }
+        CustomCheck {
+            name: "test_check".to_string(),
+            engine,
+            ast,
+        }
     }
 
     #[test]

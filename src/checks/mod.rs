@@ -109,16 +109,20 @@ use crate::checks::add_check_constraint::AddCheckConstraintCheck;
 
 /// Lazily-derived list of all built-in check names from an unfiltered registry.
 /// This avoids maintaining a manual list that can drift from the actual checks.
-static BUILTIN_CHECK_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+static BUILTIN_CHECK_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
     let registry = Registry::new();
-    registry.checks.iter().map(|c| c.name()).collect()
+    registry
+        .checks
+        .iter()
+        .map(|check| check.name().to_string())
+        .collect()
 });
 
 /// Trait for implementing safety checks on SQL statements
 pub trait Check: Send + Sync {
     /// The check's name, used for config-based disabling (e.g., "AddColumnCheck").
     /// Derived automatically from the struct name via `type_name`.
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         let full = std::any::type_name::<Self>();
         full.rsplit("::").next().unwrap_or(full)
     }
@@ -218,6 +222,7 @@ impl Registry {
             .iter()
             .filter(|check| !ctx.disables_check(check.name()))
             .flat_map(|check| {
+                let check_name = check.name().to_string();
                 let severity = if config.is_check_warning(check.name()) {
                     Severity::Warning
                 } else {
@@ -226,7 +231,7 @@ impl Registry {
                 check
                     .check(node, config, ctx)
                     .into_iter()
-                    .map(move |v| v.with_severity(severity).with_check_name(check.name()))
+                    .map(move |v| v.with_severity(severity).with_check_name(&check_name))
             })
             .collect()
     }
@@ -282,7 +287,7 @@ impl Registry {
     }
 
     /// Get all built-in check names (regardless of which are enabled).
-    pub fn builtin_check_names() -> &'static [&'static str] {
+    pub fn builtin_check_names() -> &'static [String] {
         &BUILTIN_CHECK_NAMES
     }
 }
@@ -392,10 +397,7 @@ mod tests {
     #[test]
     fn test_registry_with_all_checks_disabled() {
         let config = Config {
-            disable_checks: Registry::builtin_check_names()
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
+            disable_checks: Registry::builtin_check_names().to_vec(),
             ..Default::default()
         };
 

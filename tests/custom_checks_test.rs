@@ -319,7 +319,9 @@ fn test_unknown_check_name_detected_after_custom_checks_loaded() {
 
     // Verify it doesn't match any built-in name
     assert!(
-        !diesel_guard::checks::Registry::builtin_check_names().contains(&bogus),
+        !diesel_guard::checks::Registry::builtin_check_names()
+            .iter()
+            .any(|name| name == bogus),
         "Typo should not match any built-in check name"
     );
 

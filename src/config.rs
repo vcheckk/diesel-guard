@@ -5,6 +5,7 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use thiserror::Error;
 
 /// Generate help text for invalid check names from the registry
@@ -37,6 +38,12 @@ pub enum ConfigError {
 
     #[error("enable_checks and disable_checks cannot both be set")]
     ConflictingCheckConfig,
+
+    #[error("Custom checks directory is too large for LSP diagnostics: {message}")]
+    CustomChecksTooLarge { message: String },
+
+    #[error("Config file is larger than {max_bytes} bytes: {path}")]
+    ConfigTooLarge { path: String, max_bytes: u64 },
 }
 
 impl Diagnostic for ConfigError {
@@ -55,6 +62,10 @@ impl Diagnostic for ConfigError {
             Self::ConflictingCheckConfig => {
                 Some(Box::new("diesel_guard::config::conflicting_check_config"))
             }
+            Self::CustomChecksTooLarge { .. } => {
+                Some(Box::new("diesel_guard::config::custom_checks_too_large"))
+            }
+            Self::ConfigTooLarge { .. } => Some(Box::new("diesel_guard::config::too_large")),
         }
     }
 
@@ -70,6 +81,12 @@ impl Diagnostic for ConfigError {
             Self::InvalidFramework { .. } => Some(Box::new("Valid values: \"diesel\", \"sqlx\"")),
             Self::ConflictingCheckConfig => Some(Box::new(
                 "Use either enable_checks (whitelist) or disable_checks (blacklist), not both.",
+            )),
+            Self::CustomChecksTooLarge { .. } => Some(Box::new(
+                "Reduce the number or total size of Rhai custom checks used by the editor LSP.",
+            )),
+            Self::ConfigTooLarge { .. } => Some(Box::new(
+                "Reduce diesel-guard.toml to a normal project configuration file size.",
             )),
             _ => None,
         }
@@ -141,7 +158,17 @@ impl Config {
     /// Load config from specific path (useful for testing)
     pub fn load_from_path(path: &Utf8Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&contents).map_err(|e| {
+        Self::load_from_str(&contents)
+    }
+
+    /// Load config from a specific path with a maximum byte count.
+    pub fn load_from_path_with_limit(path: &Utf8Path, max_bytes: u64) -> Result<Self, ConfigError> {
+        let contents = read_regular_file_to_string_with_limit(path, max_bytes)?;
+        Self::load_from_str(&contents)
+    }
+
+    fn load_from_str(contents: &str) -> Result<Self, ConfigError> {
+        let config: Config = toml::from_str(contents).map_err(|e| {
             // Check if the error is due to missing framework field
             if e.to_string().contains("missing field `framework`") {
                 ConfigError::MissingFramework
@@ -151,6 +178,31 @@ impl Config {
         })?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Load config from `diesel-guard.toml` in a specific directory.
+    ///
+    /// This preserves the caller's current working directory and returns the
+    /// default configuration when the target directory has no config file.
+    pub fn load_from_dir(root: &Utf8Path) -> Result<Self, ConfigError> {
+        let config_path = root.join("diesel-guard.toml");
+
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+
+        Self::load_from_path(&config_path)
+    }
+
+    /// Load config from `diesel-guard.toml` in a directory with a maximum byte count.
+    pub fn load_from_dir_with_limit(root: &Utf8Path, max_bytes: u64) -> Result<Self, ConfigError> {
+        let config_path = root.join("diesel-guard.toml");
+
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+
+        Self::load_from_path_with_limit(&config_path, max_bytes)
     }
 
     /// Validate configuration values
@@ -187,6 +239,32 @@ impl Config {
         }
         !self.disable_checks.iter().any(|c| c == check_name)
     }
+}
+
+fn read_regular_file_to_string_with_limit(
+    path: &Utf8Path,
+    max_bytes: u64,
+) -> Result<String, ConfigError> {
+    let file_type = std::fs::symlink_metadata(path)?.file_type();
+    if !file_type.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path is not a regular file",
+        )
+        .into());
+    }
+    let file = std::fs::File::open(path)?;
+    let mut reader = file.take(max_bytes.saturating_add(1));
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(ConfigError::ConfigTooLarge {
+            path: path.to_string(),
+            max_bytes,
+        });
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err).into())
 }
 
 impl Default for Config {
@@ -253,7 +331,7 @@ mod tests {
         let help = error.help().unwrap().to_string();
 
         // Verify help text includes all check names from the registry
-        for &check_name in crate::checks::Registry::builtin_check_names() {
+        for check_name in crate::checks::Registry::builtin_check_names() {
             assert!(
                 help.contains(check_name),
                 "Help text should include '{check_name}', got: {help}"

@@ -72,6 +72,34 @@ check_down = true
 }
 
 #[test]
+fn test_load_from_dir_loads_workspace_config_without_changing_cwd() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("diesel-guard.toml");
+    fs::write(
+        &config_path,
+        r#"
+framework = "sqlx"
+check_down = true
+        "#,
+    )
+    .unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let config = Config::load_from_dir(Utf8Path::from_path(temp_dir.path()).unwrap()).unwrap();
+
+    assert_eq!(std::env::current_dir().unwrap(), cwd);
+    assert_eq!(config.framework, "sqlx");
+    assert!(config.check_down);
+}
+
+#[test]
+fn test_load_from_dir_without_config_returns_default() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let config = Config::load_from_dir(Utf8Path::from_path(temp_dir.path()).unwrap()).unwrap();
+
+    assert_eq!(config.framework, Config::default().framework);
+}
+
+#[test]
 fn test_config_start_after() {
     let temp_dir = tempdir().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("diesel-guard.toml");
