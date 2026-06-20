@@ -83,6 +83,12 @@ pub struct ServerState {
     shutdown_requested: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopControl {
+    Continue,
+    Exit(i32),
+}
+
 struct CheckerCache {
     key: CheckerCacheKey,
     checker: Arc<SafetyChecker>,
@@ -184,16 +190,31 @@ impl ServerState {
         }
 
         let path = file_uri_to_path(&uri);
-        let version = self.documents.get(&uri).and_then(|doc| doc.version);
-        let fallback_text = params
-            .text
-            .or_else(|| self.documents.get(&uri).and_then(|doc| doc.text.clone()));
-        let mut output = HandlerOutput::default();
+        let version = self.saved_document_version(&uri);
+        let fallback_text = self.saved_document_text(&uri, params.text);
 
         if let Some(path) = path.as_deref() {
-            return self.handle_save_with_file_path(uri, path, version, fallback_text, output);
+            return self.handle_save_with_file_path(uri, path, version, fallback_text);
         }
 
+        self.handle_save_without_file_path(uri, version, fallback_text)
+    }
+
+    fn saved_document_version(&self, uri: &Uri) -> Option<i32> {
+        self.documents.get(uri).and_then(|doc| doc.version)
+    }
+
+    fn saved_document_text(&self, uri: &Uri, explicit_text: Option<String>) -> Option<String> {
+        explicit_text.or_else(|| self.documents.get(uri).and_then(|doc| doc.text.clone()))
+    }
+
+    fn handle_save_without_file_path(
+        &mut self,
+        uri: Uri,
+        version: Option<i32>,
+        fallback_text: Option<String>,
+    ) -> HandlerOutput {
+        let mut output = HandlerOutput::default();
         let Some(text) = fallback_text else {
             output.diagnostics.push(self.clear_event(uri, version));
             output.messages.push(show_error_event(
@@ -203,18 +224,21 @@ impl ServerState {
         };
 
         if saved_text_is_too_large(&text) {
-            output.diagnostics.push(self.clear_event(uri, version));
-            output.messages.push(log_message_event(format!(
-                "Skipping saved-text diagnostics for SQL document larger than {MAX_SAVED_DOCUMENT_BYTES} bytes."
-            )));
+            self.push_clear_and_log(
+                &mut output,
+                uri,
+                version,
+                format!(
+                    "Skipping saved-text diagnostics for SQL document larger than {MAX_SAVED_DOCUMENT_BYTES} bytes."
+                ),
+            );
             return output;
         }
 
-        let (checker, warnings) = match self.load_checker() {
+        let (checker, output) = match self.load_checker_for_output(uri.clone(), version, output) {
             Ok(result) => result,
-            Err(err) => return self.config_error_output(uri, version, &err),
+            Err(output) => return output,
         };
-        output.push_messages(warnings);
         self.run_saved_text_diagnostics(uri, &text, version, &checker, output)
     }
 
@@ -223,45 +247,91 @@ impl ServerState {
         uri: Uri,
         path: &Utf8Path,
         version: Option<i32>,
-        mut fallback_text: Option<String>,
-        mut output: HandlerOutput,
+        fallback_text: Option<String>,
     ) -> HandlerOutput {
         match read_file_to_string_with_limit(path, MAX_SAVED_DOCUMENT_BYTES) {
             Ok(LimitedFileRead::Text(saved_text)) => {
+                let output = HandlerOutput::default();
                 self.run_saved_file_diagnostics(uri, path, &saved_text, version, output)
             }
-            Ok(LimitedFileRead::TooLarge) => {
-                output.diagnostics.push(self.clear_event(uri, version));
-                output.messages.push(log_message_event(format!(
-                    "Skipping saved-file diagnostics for SQL document larger than {MAX_SAVED_DOCUMENT_BYTES} bytes."
-                )));
-                output
-            }
-            Err(err) => {
-                let Some(text) = fallback_text.take() else {
-                    output.diagnostics.push(self.clear_event(uri, version));
-                    output.messages.push(show_error_event(format!(
-                        "Failed to read saved SQL file: {err}"
-                    )));
-                    return output;
-                };
-                if saved_text_is_too_large(&text) {
-                    output.diagnostics.push(self.clear_event(uri, version));
-                    output.messages.push(log_message_event(format!(
-                        "Skipping saved-text diagnostics for SQL document larger than {MAX_SAVED_DOCUMENT_BYTES} bytes."
-                    )));
-                    return output;
-                }
-                let (checker, warnings) = match self.load_checker() {
-                    Ok(result) => result,
-                    Err(err) => return self.config_error_output(uri, version, &err),
-                };
+            Ok(LimitedFileRead::TooLarge) => self.saved_file_too_large_output(uri, version),
+            Err(err) => self.handle_unreadable_saved_file(uri, version, fallback_text, &err),
+        }
+    }
+
+    fn saved_file_too_large_output(&mut self, uri: Uri, version: Option<i32>) -> HandlerOutput {
+        let mut output = HandlerOutput::default();
+        self.push_clear_and_log(
+            &mut output,
+            uri,
+            version,
+            format!(
+                "Skipping saved-file diagnostics for SQL document larger than {MAX_SAVED_DOCUMENT_BYTES} bytes."
+            ),
+        );
+        output
+    }
+
+    fn handle_unreadable_saved_file(
+        &mut self,
+        uri: Uri,
+        version: Option<i32>,
+        fallback_text: Option<String>,
+        err: &std::io::Error,
+    ) -> HandlerOutput {
+        let mut output = HandlerOutput::default();
+        let Some(text) = fallback_text else {
+            output.diagnostics.push(self.clear_event(uri, version));
+            output.messages.push(show_error_event(format!(
+                "Failed to read saved SQL file: {err}"
+            )));
+            return output;
+        };
+        if saved_text_is_too_large(&text) {
+            self.push_clear_and_log(
+                &mut output,
+                uri,
+                version,
+                format!(
+                    "Skipping saved-text diagnostics for SQL document larger than {MAX_SAVED_DOCUMENT_BYTES} bytes."
+                ),
+            );
+            return output;
+        }
+        let (checker, mut output) = match self.load_checker_for_output(uri.clone(), version, output)
+        {
+            Ok(result) => result,
+            Err(output) => return output,
+        };
+        output.messages.push(log_message_event(format!(
+            "Saved SQL file was not readable; checked in-memory text without migration metadata: {err}"
+        )));
+        self.run_saved_text_diagnostics(uri, &text, version, &checker, output)
+    }
+
+    fn push_clear_and_log(
+        &mut self,
+        output: &mut HandlerOutput,
+        uri: Uri,
+        version: Option<i32>,
+        message: impl Into<String>,
+    ) {
+        output.diagnostics.push(self.clear_event(uri, version));
+        output.messages.push(log_message_event(message));
+    }
+
+    fn load_checker_for_output(
+        &mut self,
+        uri: Uri,
+        version: Option<i32>,
+        mut output: HandlerOutput,
+    ) -> std::result::Result<(Arc<SafetyChecker>, HandlerOutput), HandlerOutput> {
+        match self.load_checker() {
+            Ok((checker, warnings)) => {
                 output.push_messages(warnings);
-                output.messages.push(log_message_event(format!(
-                    "Saved SQL file was not readable; checked in-memory text without migration metadata: {err}"
-                )));
-                self.run_saved_text_diagnostics(uri, &text, version, &checker, output)
+                Ok((checker, output))
             }
+            Err(err) => Err(self.config_error_output(uri, version, &err)),
         }
     }
 
@@ -271,13 +341,13 @@ impl ServerState {
         path: &Utf8Path,
         saved_text: &str,
         version: Option<i32>,
-        mut output: HandlerOutput,
+        output: HandlerOutput,
     ) -> HandlerOutput {
-        let (checker, warnings) = match self.load_checker() {
+        let (checker, mut output) = match self.load_checker_for_output(uri.clone(), version, output)
+        {
             Ok(result) => result,
-            Err(err) => return self.config_error_output(uri, version, &err),
+            Err(output) => return output,
         };
-        output.push_messages(warnings);
         match checker.check_file_sql_with_warnings(path, saved_text) {
             Ok((violations, check_warnings)) => {
                 output.push_messages(check_warnings);
@@ -380,13 +450,13 @@ impl ServerState {
             return output;
         }
 
-        let (checker, warnings) = match self.load_checker() {
+        let output = HandlerOutput::default();
+        let (checker, mut output) = match self.load_checker_for_output(uri.clone(), version, output)
+        {
             Ok(result) => result,
-            Err(err) => return self.config_error_output(uri, version, &err),
+            Err(output) => return output,
         };
 
-        let mut output = HandlerOutput::default();
-        output.push_messages(warnings);
         let check_result = file_uri_to_path(&uri).map_or_else(
             || checker.check_sql_with_warnings(text),
             |path| checker.check_file_sql_with_warnings(&path, text),
@@ -555,77 +625,105 @@ impl ServerState {
 
     fn run_loop(&mut self, connection: &Connection) -> Result<i32> {
         for message in &connection.receiver {
-            match message {
-                Message::Request(request) => {
-                    if connection
-                        .handle_shutdown(&request)
-                        .map_err(protocol_error)?
-                    {
-                        self.shutdown_requested = true;
-                        continue;
-                    }
-                    send_response(
-                        connection,
-                        Response::new_err(
-                            request.id,
-                            ErrorCode::MethodNotFound as i32,
-                            format!("Unsupported request method: {}", request.method),
-                        ),
-                    )?;
-                }
-                Message::Notification(notification) => {
-                    if notification.method == lsp_types::notification::Exit::METHOD {
-                        return Ok(i32::from(!self.shutdown_requested));
-                    }
-
-                    let output = self.handle_notification(notification);
-                    Self::apply_output(connection, output)?;
-                }
-                Message::Response(_) => {}
+            match self.handle_message(connection, message)? {
+                LoopControl::Continue => {}
+                LoopControl::Exit(code) => return Ok(code),
             }
         }
 
         Ok(0)
     }
 
+    fn handle_message(&mut self, connection: &Connection, message: Message) -> Result<LoopControl> {
+        match message {
+            Message::Request(request) => self.handle_request_message(connection, request),
+            Message::Notification(notification) => {
+                self.handle_notification_message(connection, notification)
+            }
+            Message::Response(_) => Ok(LoopControl::Continue),
+        }
+    }
+
+    fn handle_request_message(
+        &mut self,
+        connection: &Connection,
+        request: lsp_server::Request,
+    ) -> Result<LoopControl> {
+        if connection
+            .handle_shutdown(&request)
+            .map_err(protocol_error)?
+        {
+            self.shutdown_requested = true;
+            return Ok(LoopControl::Continue);
+        }
+
+        send_response(
+            connection,
+            Response::new_err(
+                request.id,
+                ErrorCode::MethodNotFound as i32,
+                format!("Unsupported request method: {}", request.method),
+            ),
+        )?;
+        Ok(LoopControl::Continue)
+    }
+
+    fn handle_notification_message(
+        &mut self,
+        connection: &Connection,
+        notification: Notification,
+    ) -> Result<LoopControl> {
+        if notification.method == lsp_types::notification::Exit::METHOD {
+            return Ok(LoopControl::Exit(i32::from(!self.shutdown_requested)));
+        }
+
+        let output = self.handle_notification(notification);
+        Self::apply_output(connection, output)?;
+        Ok(LoopControl::Continue)
+    }
+
     fn handle_notification(&mut self, notification: Notification) -> HandlerOutput {
         match notification.method.as_str() {
             lsp_types::notification::Initialized::METHOD => HandlerOutput::default(),
             lsp_types::notification::DidOpenTextDocument::METHOD => {
-                match serde_json::from_value(notification.params) {
-                    Ok(params) => self.handle_open(params),
-                    Err(err) => deserialize_error_output("didOpen", &err),
-                }
+                self.handle_typed_notification("didOpen", notification.params, Self::handle_open)
             }
-            lsp_types::notification::DidChangeTextDocument::METHOD => {
-                match serde_json::from_value(notification.params) {
-                    Ok(params) => self.handle_change(params),
-                    Err(err) => deserialize_error_output("didChange", &err),
-                }
-            }
+            lsp_types::notification::DidChangeTextDocument::METHOD => self
+                .handle_typed_notification("didChange", notification.params, Self::handle_change),
             lsp_types::notification::DidSaveTextDocument::METHOD => {
-                match serde_json::from_value(notification.params) {
-                    Ok(params) => self.handle_save(params),
-                    Err(err) => deserialize_error_output("didSave", &err),
-                }
+                self.handle_typed_notification("didSave", notification.params, Self::handle_save)
             }
             lsp_types::notification::DidCloseTextDocument::METHOD => {
-                match serde_json::from_value(notification.params) {
-                    Ok(params) => self.handle_close(params),
-                    Err(err) => deserialize_error_output("didClose", &err),
-                }
+                self.handle_typed_notification("didClose", notification.params, Self::handle_close)
             }
-            other => {
-                let mut output = HandlerOutput::default();
-                if !self.warned_unsupported_notification {
-                    self.warned_unsupported_notification = true;
-                    output.messages.push(log_message_event(format!(
-                        "Ignoring unsupported notification: {other}"
-                    )));
-                }
-                output
-            }
+            other => self.unsupported_notification_output(other),
         }
+    }
+
+    fn handle_typed_notification<T>(
+        &mut self,
+        method_label: &str,
+        params: serde_json::Value,
+        handler: fn(&mut Self, T) -> HandlerOutput,
+    ) -> HandlerOutput
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        match serde_json::from_value(params) {
+            Ok(params) => handler(self, params),
+            Err(err) => deserialize_error_output(method_label, &err),
+        }
+    }
+
+    fn unsupported_notification_output(&mut self, method: &str) -> HandlerOutput {
+        let mut output = HandlerOutput::default();
+        if !self.warned_unsupported_notification {
+            self.warned_unsupported_notification = true;
+            output.messages.push(log_message_event(format!(
+                "Ignoring unsupported notification: {method}"
+            )));
+        }
+        output
     }
 }
 
@@ -737,31 +835,12 @@ fn custom_checks_signature(
     let mut total_hash_bytes = 0_u64;
 
     for (index, entry) in entries.enumerate() {
-        if index >= MAX_CUSTOM_CHECK_DIR_ENTRIES {
-            return Err(custom_checks_too_large(format!(
-                "more than {MAX_CUSTOM_CHECK_DIR_ENTRIES} directory entries in {custom_checks_dir}"
-            )));
-        }
+        enforce_custom_check_entry_limit(index, custom_checks_dir)?;
 
-        let Ok(entry) = entry else {
+        let Some(path) = lsp_custom_check_file_path(entry) else {
             continue;
         };
-        let path = entry.path();
-        if path.extension().is_none_or(|extension| extension != "rhai") {
-            continue;
-        }
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_file() {
-            continue;
-        }
-
-        if signature.len() >= MAX_LSP_CUSTOM_CHECK_FILES {
-            return Err(custom_checks_too_large(format!(
-                "more than {MAX_LSP_CUSTOM_CHECK_FILES} .rhai custom check files in {custom_checks_dir}"
-            )));
-        }
+        enforce_custom_check_file_limit(&signature, custom_checks_dir)?;
 
         let file_signature = custom_check_file_signature(&path, &mut total_hash_bytes)?;
         signature.push(file_signature);
@@ -769,6 +848,44 @@ fn custom_checks_signature(
 
     signature.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(signature)
+}
+
+fn enforce_custom_check_entry_limit(
+    index: usize,
+    custom_checks_dir: &str,
+) -> std::result::Result<(), ConfigError> {
+    if index >= MAX_CUSTOM_CHECK_DIR_ENTRIES {
+        return Err(custom_checks_too_large(format!(
+            "more than {MAX_CUSTOM_CHECK_DIR_ENTRIES} directory entries in {custom_checks_dir}"
+        )));
+    }
+    Ok(())
+}
+
+fn lsp_custom_check_file_path(
+    entry: std::io::Result<std::fs::DirEntry>,
+) -> Option<std::path::PathBuf> {
+    let entry = entry.ok()?;
+    let path = entry.path();
+    if path.extension().is_none_or(|extension| extension != "rhai") {
+        return None;
+    }
+    if !entry.file_type().ok()?.is_file() {
+        return None;
+    }
+    Some(path)
+}
+
+fn enforce_custom_check_file_limit(
+    signature: &[CustomCheckFileSignature],
+    custom_checks_dir: &str,
+) -> std::result::Result<(), ConfigError> {
+    if signature.len() >= MAX_LSP_CUSTOM_CHECK_FILES {
+        return Err(custom_checks_too_large(format!(
+            "more than {MAX_LSP_CUSTOM_CHECK_FILES} .rhai custom check files in {custom_checks_dir}"
+        )));
+    }
+    Ok(())
 }
 
 fn custom_check_file_signature(
@@ -1904,6 +2021,129 @@ mod tests {
     }
 
     #[test]
+    fn run_loop_returns_error_code_when_exit_precedes_shutdown() {
+        let root = temp_root();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+        let (server, client) = Connection::memory();
+
+        client
+            .sender
+            .send(Message::Notification(Notification::new(
+                lsp_types::notification::Exit::METHOD.to_string(),
+                json!(null),
+            )))
+            .unwrap();
+
+        assert_eq!(state.run_loop(&server).unwrap(), 1);
+    }
+
+    #[test]
+    fn run_loop_replies_to_unsupported_request_before_exit() {
+        let root = temp_root();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+        let (server, client) = Connection::memory();
+
+        client
+            .sender
+            .send(Message::Request(lsp_server::Request::new(
+                RequestId::from(7),
+                "workspace/symbol".to_string(),
+                json!({}),
+            )))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(Notification::new(
+                lsp_types::notification::Exit::METHOD.to_string(),
+                json!(null),
+            )))
+            .unwrap();
+
+        assert_eq!(state.run_loop(&server).unwrap(), 1);
+        let Message::Response(response) = client.receiver.try_recv().unwrap() else {
+            panic!("expected unsupported request response");
+        };
+        assert_eq!(
+            response.error.unwrap().code,
+            ErrorCode::MethodNotFound as i32
+        );
+    }
+
+    #[test]
+    fn run_loop_shutdown_then_exit_returns_success() {
+        let root = temp_root();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+        let (server, client) = Connection::memory();
+        let lsp_server::Connection { sender, receiver } = client;
+
+        sender
+            .send(Message::Request(lsp_server::Request::new(
+                RequestId::from(9),
+                "shutdown".to_string(),
+                json!(null),
+            )))
+            .unwrap();
+        sender
+            .send(Message::Notification(Notification::new(
+                lsp_types::notification::Exit::METHOD.to_string(),
+                json!(null),
+            )))
+            .unwrap();
+        drop(sender);
+
+        assert_eq!(state.run_loop(&server).unwrap(), 0);
+        let Message::Response(response) = receiver.try_recv().unwrap() else {
+            panic!("expected shutdown response");
+        };
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn handle_notification_dispatches_did_open() {
+        let root = temp_root();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+        let uri = uri("file:///tmp/notify-open.sql");
+
+        let output = state.handle_notification(Notification::new(
+            lsp_types::notification::DidOpenTextDocument::METHOD.to_string(),
+            json!({
+                "textDocument": {
+                    "uri": uri.to_string(),
+                    "languageId": "sql",
+                    "version": 3,
+                    "text": "SELECT 1;"
+                }
+            }),
+        ));
+
+        assert!(output.messages.is_empty());
+        assert_eq!(state.document(&uri).unwrap().version, Some(3));
+    }
+
+    #[test]
+    fn malformed_supported_notification_emits_deserialize_message() {
+        let root = temp_root();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+
+        let output = state.handle_notification(Notification::new(
+            lsp_types::notification::DidSaveTextDocument::METHOD.to_string(),
+            json!({}),
+        ));
+
+        assert_eq!(output.messages.len(), 1);
+        assert!(
+            output.messages[0]
+                .message
+                .contains("Failed to deserialize didSave notification")
+        );
+    }
+
+    #[test]
     fn repeated_unsupported_notifications_do_not_repeat_log() {
         let root = temp_root();
         let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
@@ -1963,6 +2203,29 @@ mod tests {
         assert_eq!(first[0].len, second[0].len);
         assert!(first[0].content_hash.is_some());
         assert_ne!(first[0].content_hash, second[0].content_hash);
+    }
+
+    #[test]
+    fn custom_check_signature_is_sorted_and_ignores_non_files() {
+        let root = temp_root();
+        let checks = root.path().join("checks");
+        std::fs::create_dir(&checks).unwrap();
+        std::fs::write(checks.join("zeta.rhai"), "return;").unwrap();
+        std::fs::write(checks.join("alpha.rhai"), "return;").unwrap();
+        std::fs::write(checks.join("notes.txt"), "return;").unwrap();
+        std::fs::create_dir(checks.join("nested.rhai")).unwrap();
+        let config = Config {
+            custom_checks_dir: Some(checks.to_str().unwrap().to_string()),
+            ..Config::default()
+        };
+
+        let signature = custom_checks_signature(&config).unwrap();
+
+        let paths: Vec<&str> = signature
+            .iter()
+            .map(|entry| Utf8Path::new(&entry.path).file_name().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["alpha.rhai", "zeta.rhai"]);
     }
 
     #[test]

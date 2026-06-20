@@ -336,82 +336,151 @@ pub fn load_custom_checks(
 }
 
 fn discover_custom_check_files(dir: &Utf8Path) -> (Vec<CustomCheckFile>, Vec<ScriptError>) {
-    let mut files = Vec::new();
-    let mut errors = Vec::new();
     let read_dir = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
+        Ok(read_dir) => read_dir,
         Err(e) => {
-            errors.push(ScriptError {
-                file: dir.to_string(),
-                message: format!("Failed to read directory: {e}"),
-            });
-            return (files, errors);
+            return (
+                Vec::new(),
+                vec![ScriptError {
+                    file: dir.to_string(),
+                    message: format!("Failed to read directory: {e}"),
+                }],
+            );
         }
     };
+    collect_custom_check_files(dir, read_dir)
+}
 
+fn collect_custom_check_files(
+    dir: &Utf8Path,
+    read_dir: std::fs::ReadDir,
+) -> (Vec<CustomCheckFile>, Vec<ScriptError>) {
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
     for (index, entry) in read_dir.enumerate() {
-        if index >= MAX_CUSTOM_CHECK_DIR_ENTRIES {
-            errors.push(ScriptError {
-                file: dir.to_string(),
-                message: format!(
-                    "Custom checks directory has more than {MAX_CUSTOM_CHECK_DIR_ENTRIES} entries"
-                ),
-            });
+        if !custom_check_entry_limit_allows(dir, index, &mut errors) {
             break;
         }
 
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                errors.push(ScriptError {
-                    file: dir.to_string(),
-                    message: format!("Failed to read directory entry: {e}"),
-                });
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "rhai") {
+        let Some(file) = custom_check_file_from_entry(dir, entry, &mut errors) else {
             continue;
-        }
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(e) => {
-                errors.push(ScriptError {
-                    file: path.display().to_string(),
-                    message: format!("Failed to inspect file type: {e}"),
-                });
-                continue;
-            }
         };
-        if !file_type.is_file() {
-            errors.push(ScriptError {
-                file: path.display().to_string(),
-                message: "Custom check path is not a regular file".to_string(),
-            });
-            continue;
-        }
-
-        if files.len() >= MAX_CUSTOM_CHECK_FILES {
-            errors.push(ScriptError {
-                file: dir.to_string(),
-                message: format!(
-                    "Custom checks directory has more than {MAX_CUSTOM_CHECK_FILES} .rhai files"
-                ),
-            });
+        if !push_custom_check_file(dir, file, &mut files, &mut errors) {
             break;
         }
-
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        files.push(CustomCheckFile { path, stem });
     }
 
     files.sort_by(|left, right| left.path.file_name().cmp(&right.path.file_name()));
     (files, errors)
+}
+
+fn custom_check_entry_limit_allows(
+    dir: &Utf8Path,
+    index: usize,
+    errors: &mut Vec<ScriptError>,
+) -> bool {
+    if index < MAX_CUSTOM_CHECK_DIR_ENTRIES {
+        return true;
+    }
+
+    errors.push(ScriptError {
+        file: dir.to_string(),
+        message: format!(
+            "Custom checks directory has more than {MAX_CUSTOM_CHECK_DIR_ENTRIES} entries"
+        ),
+    });
+    false
+}
+
+fn custom_check_file_from_entry(
+    dir: &Utf8Path,
+    entry: std::io::Result<std::fs::DirEntry>,
+    errors: &mut Vec<ScriptError>,
+) -> Option<CustomCheckFile> {
+    let entry = readable_custom_check_entry(dir, entry, errors)?;
+    let path = rhai_entry_path(&entry)?;
+    if !custom_check_entry_is_regular_file(&entry, &path, errors) {
+        return None;
+    }
+    Some(custom_check_file(path))
+}
+
+fn readable_custom_check_entry(
+    dir: &Utf8Path,
+    entry: std::io::Result<std::fs::DirEntry>,
+    errors: &mut Vec<ScriptError>,
+) -> Option<std::fs::DirEntry> {
+    match entry {
+        Ok(entry) => Some(entry),
+        Err(e) => {
+            errors.push(ScriptError {
+                file: dir.to_string(),
+                message: format!("Failed to read directory entry: {e}"),
+            });
+            None
+        }
+    }
+}
+
+fn rhai_entry_path(entry: &std::fs::DirEntry) -> Option<std::path::PathBuf> {
+    let path = entry.path();
+    path.extension()
+        .is_some_and(|ext| ext == "rhai")
+        .then_some(path)
+}
+
+fn custom_check_entry_is_regular_file(
+    entry: &std::fs::DirEntry,
+    path: &std::path::Path,
+    errors: &mut Vec<ScriptError>,
+) -> bool {
+    let file_type = match entry.file_type() {
+        Ok(file_type) => file_type,
+        Err(e) => {
+            errors.push(ScriptError {
+                file: path.display().to_string(),
+                message: format!("Failed to inspect file type: {e}"),
+            });
+            return false;
+        }
+    };
+    if file_type.is_file() {
+        return true;
+    }
+
+    errors.push(ScriptError {
+        file: path.display().to_string(),
+        message: "Custom check path is not a regular file".to_string(),
+    });
+    false
+}
+
+fn custom_check_file(path: std::path::PathBuf) -> CustomCheckFile {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    CustomCheckFile { path, stem }
+}
+
+fn push_custom_check_file(
+    dir: &Utf8Path,
+    file: CustomCheckFile,
+    files: &mut Vec<CustomCheckFile>,
+    errors: &mut Vec<ScriptError>,
+) -> bool {
+    if files.len() >= MAX_CUSTOM_CHECK_FILES {
+        errors.push(ScriptError {
+            file: dir.to_string(),
+            message: format!(
+                "Custom checks directory has more than {MAX_CUSTOM_CHECK_FILES} .rhai files"
+            ),
+        });
+        return false;
+    }
+    files.push(file);
+    true
 }
 
 fn read_script_source(path: &std::path::Path) -> std::io::Result<ScriptSource> {
@@ -889,6 +958,26 @@ mod tests {
                 .message
                 .contains("Custom checks directory has more than")
         }));
+    }
+
+    #[test]
+    fn test_discover_custom_check_files_sorts_and_filters_entries() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let dir_path = Utf8Path::from_path(dir.path()).unwrap();
+        fs::write(dir.path().join("zeta.rhai"), "return;").unwrap();
+        fs::write(dir.path().join("alpha.rhai"), "return;").unwrap();
+        fs::write(dir.path().join("notes.txt"), "return;").unwrap();
+        fs::create_dir(dir.path().join("nested.rhai")).unwrap();
+
+        let (files, errors) = discover_custom_check_files(dir_path);
+
+        let names: Vec<&str> = files
+            .iter()
+            .map(|file| file.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["alpha.rhai", "zeta.rhai"]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("not a regular file"));
     }
 
     #[test]
