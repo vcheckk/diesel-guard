@@ -83,7 +83,6 @@ pub struct ServerState {
 struct CheckerCache {
     key: CheckerCacheKey,
     checker: Arc<SafetyChecker>,
-    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -507,7 +506,7 @@ impl ServerState {
         };
 
         if let Some(cache) = self.checker_cache.as_ref().filter(|cache| cache.key == key) {
-            return Ok((Arc::clone(&cache.checker), cache.warnings.clone()));
+            return Ok((Arc::clone(&cache.checker), Vec::new()));
         }
 
         let (checker, mut warnings) = SafetyChecker::with_config_and_warnings(config);
@@ -516,7 +515,6 @@ impl ServerState {
         self.checker_cache = Some(CheckerCache {
             key,
             checker: Arc::clone(&checker),
-            warnings: warnings.clone(),
         });
         Ok((checker, warnings))
     }
@@ -2103,6 +2101,44 @@ mod tests {
 
         assert_eq!(output.diagnostics.len(), 1);
         assert!(output.diagnostics[0].diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cached_lsp_checker_does_not_replay_custom_check_warnings() {
+        let root = temp_root();
+        let checks = root.path().join("checks");
+        std::fs::create_dir(&checks).unwrap();
+        std::fs::write(checks.join("bad.rhai"), "let x = ;").unwrap();
+        std::fs::write(
+            root.path().join("diesel-guard.toml"),
+            "framework = \"diesel\"\ncustom_checks_dir = \"checks\"\n",
+        )
+        .unwrap();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+        let uri = uri("file:///tmp/warning-cache.sql");
+
+        let output = state.handle_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "sql".to_string(),
+                version: 1,
+                text: "SELECT 1;".to_string(),
+            },
+        });
+        assert_eq!(output.messages.len(), 1);
+        assert!(output.messages[0].message.contains("Compilation error"));
+
+        let output = state.handle_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier { uri, version: 2 },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "SELECT 2;".to_string(),
+            }],
+        });
+
+        assert!(output.messages.is_empty());
     }
 
     #[test]
