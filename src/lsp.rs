@@ -5,7 +5,7 @@ use crate::violation::Severity;
 use crate::{SafetyChecker, ViolationList};
 use camino::{Utf8Path, Utf8PathBuf};
 use lsp_server::{
-    Connection, ErrorCode, Message, Notification, RequestId, Response, ResponseError,
+    Connection, ErrorCode, IoThreads, Message, Notification, RequestId, Response, ResponseError,
 };
 use lsp_types::notification::Notification as LspNotification;
 use lsp_types::{
@@ -114,6 +114,46 @@ enum LimitedFileRead {
     TooLarge,
 }
 
+#[derive(Clone, Copy)]
+enum ParseErrorOutput {
+    PublishDiagnostic,
+    ClearOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentNotificationKind {
+    Open,
+    Change,
+    Save,
+    Close,
+}
+
+impl DocumentNotificationKind {
+    fn handle(self, state: &mut ServerState, params: serde_json::Value) -> HandlerOutput {
+        match self {
+            Self::Open => {
+                state.handle_typed_notification("didOpen", params, ServerState::handle_open)
+            }
+            Self::Change => {
+                state.handle_typed_notification("didChange", params, ServerState::handle_change)
+            }
+            Self::Save => {
+                state.handle_typed_notification("didSave", params, ServerState::handle_save)
+            }
+            Self::Close => {
+                state.handle_typed_notification("didClose", params, ServerState::handle_close)
+            }
+        }
+    }
+}
+
+struct CheckDiagnosticContext<'a> {
+    uri: Uri,
+    version: Option<i32>,
+    parse_error_output: ParseErrorOutput,
+    error_context: &'a str,
+}
+
 impl ServerState {
     pub fn new(root: Utf8PathBuf) -> Self {
         Self {
@@ -149,38 +189,53 @@ impl ServerState {
         let uri = params.text_document.uri;
         let version = Some(params.text_document.version);
         if !is_sql_file_uri(&uri) {
-            self.documents.remove(&uri);
-            return self.clear_if_needed(uri, version);
+            return self.handle_non_sql_change(uri, version);
         }
 
         let Some(text) = final_full_sync_text(&params.content_changes) else {
-            self.store_document_state(
-                uri.clone(),
-                DocumentState {
-                    text: None,
-                    version,
-                },
-            );
-            let mut output = self.clear_if_needed(uri, version);
-            if !self.warned_incremental_change {
-                self.warned_incremental_change = true;
-                output.messages.push(log_message_event(
-                    "Received incremental textDocument/didChange despite full-sync capability; diagnostics were cleared.",
-                ));
-            }
-            return output;
+            return self.handle_incremental_change(uri, version);
         };
 
-        if self
-            .documents
-            .get(&uri)
-            .is_some_and(|doc| doc.text.as_deref() == Some(text) && doc.version == version)
-        {
+        if self.is_unchanged_document(&uri, text, version) {
             return HandlerOutput::default();
         }
 
         self.store_document_state(uri.clone(), live_document_state(text, version));
         self.run_live_diagnostics(uri, text, version)
+    }
+
+    fn handle_non_sql_change(&mut self, uri: Uri, version: Option<i32>) -> HandlerOutput {
+        self.documents.remove(&uri);
+        self.clear_if_needed(uri, version)
+    }
+
+    fn handle_incremental_change(&mut self, uri: Uri, version: Option<i32>) -> HandlerOutput {
+        self.store_document_state(
+            uri.clone(),
+            DocumentState {
+                text: None,
+                version,
+            },
+        );
+        let mut output = self.clear_if_needed(uri, version);
+        self.push_incremental_change_warning(&mut output);
+        output
+    }
+
+    fn push_incremental_change_warning(&mut self, output: &mut HandlerOutput) {
+        if self.warned_incremental_change {
+            return;
+        }
+        self.warned_incremental_change = true;
+        output.messages.push(log_message_event(
+            "Received incremental textDocument/didChange despite full-sync capability; diagnostics were cleared.",
+        ));
+    }
+
+    fn is_unchanged_document(&self, uri: &Uri, text: &str, version: Option<i32>) -> bool {
+        self.documents
+            .get(uri)
+            .is_some_and(|doc| doc.text.as_deref() == Some(text) && doc.version == version)
     }
 
     pub fn handle_save(&mut self, params: DidSaveTextDocumentParams) -> HandlerOutput {
@@ -343,34 +398,22 @@ impl ServerState {
         version: Option<i32>,
         output: HandlerOutput,
     ) -> HandlerOutput {
-        let (checker, mut output) = match self.load_checker_for_output(uri.clone(), version, output)
-        {
+        let (checker, output) = match self.load_checker_for_output(uri.clone(), version, output) {
             Ok(result) => result,
             Err(output) => return output,
         };
-        match checker.check_file_sql_with_warnings(path, saved_text) {
-            Ok((violations, check_warnings)) => {
-                output.push_messages(check_warnings);
-                output.diagnostics.extend(self.violations_events(
-                    uri,
-                    saved_text,
-                    &violations,
-                    version,
-                ));
-            }
-            Err(err) if is_parse_error(&err) => {
-                output
-                    .diagnostics
-                    .extend(self.parse_error_diagnostics_events(uri, saved_text, &err, version));
-            }
-            Err(err) => {
-                output.diagnostics.push(self.clear_event(uri, version));
-                output.messages.push(show_error_event(format!(
-                    "Failed to check saved SQL file: {err}"
-                )));
-            }
-        }
-        output
+        let check_result = checker.check_file_sql_with_warnings(path, saved_text);
+        self.apply_check_result(
+            CheckDiagnosticContext {
+                uri,
+                version,
+                parse_error_output: ParseErrorOutput::PublishDiagnostic,
+                error_context: "Failed to check saved SQL file",
+            },
+            saved_text,
+            output,
+            check_result,
+        )
     }
 
     fn run_saved_text_diagnostics(
@@ -389,26 +432,18 @@ impl ServerState {
             return output;
         }
 
-        match checker.check_sql_with_warnings(text) {
-            Ok((violations, check_warnings)) => {
-                output.push_messages(check_warnings);
-                output
-                    .diagnostics
-                    .extend(self.violations_events(uri, text, &violations, version));
-            }
-            Err(err) if is_parse_error(&err) => {
-                output
-                    .diagnostics
-                    .extend(self.parse_error_diagnostics_events(uri, text, &err, version));
-            }
-            Err(err) => {
-                output.diagnostics.push(self.clear_event(uri, version));
-                output.messages.push(show_error_event(format!(
-                    "Failed to check saved SQL text: {err}"
-                )));
-            }
-        }
-        output
+        let check_result = checker.check_sql_with_warnings(text);
+        self.apply_check_result(
+            CheckDiagnosticContext {
+                uri,
+                version,
+                parse_error_output: ParseErrorOutput::PublishDiagnostic,
+                error_context: "Failed to check saved SQL text",
+            },
+            text,
+            output,
+            check_result,
+        )
     }
 
     pub fn handle_close(&mut self, params: DidCloseTextDocumentParams) -> HandlerOutput {
@@ -438,47 +473,132 @@ impl ServerState {
         text: &str,
         version: Option<i32>,
     ) -> HandlerOutput {
-        if !is_sql_file_uri(&uri) {
-            return self.clear_if_needed(uri, version);
-        }
-
-        if text.len() > MAX_LIVE_DOCUMENT_BYTES {
-            let mut output = self.clear_if_needed(uri, version);
-            output.messages.push(log_message_event(format!(
-                "Skipping live diagnostics for SQL document larger than {MAX_LIVE_DOCUMENT_BYTES} bytes; very large live and saved SQL documents are skipped to keep the editor responsive."
-            )));
+        if let Some(output) = self.live_diagnostics_precheck(&uri, text, version) {
             return output;
         }
 
         let output = HandlerOutput::default();
-        let (checker, mut output) = match self.load_checker_for_output(uri.clone(), version, output)
-        {
+        let (checker, output) = match self.load_checker_for_output(uri.clone(), version, output) {
             Ok(result) => result,
             Err(output) => return output,
         };
 
-        let check_result = file_uri_to_path(&uri).map_or_else(
-            || checker.check_sql_with_warnings(text),
-            |path| checker.check_file_sql_with_warnings(&path, text),
-        );
+        let check_result = check_live_sql(&checker, &uri, text);
+        self.apply_check_result(
+            CheckDiagnosticContext {
+                uri,
+                version,
+                parse_error_output: ParseErrorOutput::ClearOnly,
+                error_context: "Failed to check SQL document",
+            },
+            text,
+            output,
+            check_result,
+        )
+    }
+
+    fn live_diagnostics_precheck(
+        &mut self,
+        uri: &Uri,
+        text: &str,
+        version: Option<i32>,
+    ) -> Option<HandlerOutput> {
+        if !is_sql_file_uri(uri) {
+            return Some(self.clear_if_needed(uri.clone(), version));
+        }
+
+        live_text_is_too_large(text).then(|| self.oversized_live_output(uri.clone(), version))
+    }
+
+    fn oversized_live_output(&mut self, uri: Uri, version: Option<i32>) -> HandlerOutput {
+        let mut output = self.clear_if_needed(uri, version);
+        output.messages.push(log_message_event(format!(
+            "Skipping live diagnostics for SQL document larger than {MAX_LIVE_DOCUMENT_BYTES} bytes; very large live and saved SQL documents are skipped to keep the editor responsive."
+        )));
+        output
+    }
+
+    fn apply_check_result(
+        &mut self,
+        context: CheckDiagnosticContext<'_>,
+        text: &str,
+        mut output: HandlerOutput,
+        check_result: Result<(ViolationList, Vec<String>)>,
+    ) -> HandlerOutput {
         match check_result {
             Ok((violations, check_warnings)) => {
-                output.push_messages(check_warnings);
-                output
-                    .diagnostics
-                    .extend(self.violations_events(uri, text, &violations, version));
+                self.append_successful_diagnostics(
+                    context.uri,
+                    text,
+                    context.version,
+                    &mut output,
+                    &violations,
+                    check_warnings,
+                );
             }
-            Err(err) if is_parse_error(&err) => {
-                output.diagnostics.push(self.clear_event(uri, version));
-            }
-            Err(err) => {
-                output.diagnostics.push(self.clear_event(uri, version));
-                output.messages.push(show_error_event(format!(
-                    "Failed to check SQL document: {err}"
-                )));
-            }
+            Err(err) if is_parse_error(&err) => self.append_parse_error_diagnostics(
+                context.uri,
+                text,
+                context.version,
+                &mut output,
+                &err,
+                context.parse_error_output,
+            ),
+            Err(err) => self.append_check_error(
+                context.uri,
+                context.version,
+                &mut output,
+                context.error_context,
+                &err,
+            ),
         }
         output
+    }
+
+    fn append_successful_diagnostics(
+        &mut self,
+        uri: Uri,
+        text: &str,
+        version: Option<i32>,
+        output: &mut HandlerOutput,
+        violations: &ViolationList,
+        check_warnings: Vec<String>,
+    ) {
+        output.push_messages(check_warnings);
+        output
+            .diagnostics
+            .extend(self.violations_events(uri, text, violations, version));
+    }
+
+    fn append_parse_error_diagnostics(
+        &mut self,
+        uri: Uri,
+        text: &str,
+        version: Option<i32>,
+        output: &mut HandlerOutput,
+        err: &DieselGuardError,
+        parse_error_output: ParseErrorOutput,
+    ) {
+        match parse_error_output {
+            ParseErrorOutput::PublishDiagnostic => output
+                .diagnostics
+                .extend(self.parse_error_diagnostics_events(uri, text, err, version)),
+            ParseErrorOutput::ClearOnly => output.diagnostics.push(self.clear_event(uri, version)),
+        }
+    }
+
+    fn append_check_error(
+        &mut self,
+        uri: Uri,
+        version: Option<i32>,
+        output: &mut HandlerOutput,
+        context: &str,
+        err: &DieselGuardError,
+    ) {
+        output.diagnostics.push(self.clear_event(uri, version));
+        output
+            .messages
+            .push(show_error_event(format!("{context}: {err}")));
     }
 
     fn clear_if_needed(&mut self, uri: Uri, version: Option<i32>) -> HandlerOutput {
@@ -572,25 +692,40 @@ impl ServerState {
     fn load_checker(
         &mut self,
     ) -> std::result::Result<(Arc<SafetyChecker>, Vec<String>), ConfigError> {
-        let mut config = load_lsp_config(&self.root)?;
-        let mut cache_warnings = Vec::new();
-        let key = match checker_cache_key(&config) {
-            Ok(key) => key,
-            Err(ConfigError::CustomChecksTooLarge { message }) => {
-                cache_warnings.push(format!(
-                    "Custom checks are disabled for LSP diagnostics: {message}"
-                ));
-                config.custom_checks_dir = None;
-                checker_cache_key(&config)?
-            }
-            Err(err) => return Err(err),
-        };
+        let (config, key, cache_warnings) = self.load_checker_inputs()?;
 
-        if let Some(cache) = self.checker_cache.as_ref().filter(|cache| cache.key == key) {
-            self.last_config_error_message = None;
-            return Ok((Arc::clone(&cache.checker), Vec::new()));
+        if let Some(checker) = self.cached_checker(&key) {
+            return Ok((checker, Vec::new()));
         }
 
+        Ok(self.build_cached_checker(config, key, cache_warnings))
+    }
+
+    fn load_checker_inputs(
+        &self,
+    ) -> std::result::Result<(Config, CheckerCacheKey, Vec<String>), ConfigError> {
+        let mut config = load_lsp_config(&self.root)?;
+        let mut cache_warnings = Vec::new();
+        let key = checker_cache_key_with_lsp_fallback(&mut config, &mut cache_warnings)?;
+        Ok((config, key, cache_warnings))
+    }
+
+    fn cached_checker(&mut self, key: &CheckerCacheKey) -> Option<Arc<SafetyChecker>> {
+        let checker = self
+            .checker_cache
+            .as_ref()
+            .filter(|cache| cache.key == *key)
+            .map(|cache| Arc::clone(&cache.checker))?;
+        self.last_config_error_message = None;
+        Some(checker)
+    }
+
+    fn build_cached_checker(
+        &mut self,
+        config: Config,
+        key: CheckerCacheKey,
+        cache_warnings: Vec<String>,
+    ) -> (Arc<SafetyChecker>, Vec<String>) {
         let (checker, mut warnings) = SafetyChecker::with_config_and_warnings(config);
         warnings.splice(0..0, cache_warnings);
         let checker = Arc::new(checker);
@@ -599,27 +734,12 @@ impl ServerState {
             checker: Arc::clone(&checker),
         });
         self.last_config_error_message = None;
-        Ok((checker, warnings))
+        (checker, warnings)
     }
 
     fn apply_output(connection: &Connection, output: HandlerOutput) -> Result<()> {
-        for diagnostic in output.diagnostics {
-            let params = PublishDiagnosticsParams::new(
-                diagnostic.uri,
-                diagnostic.diagnostics,
-                diagnostic.version,
-            );
-            send_notification::<lsp_types::notification::PublishDiagnostics>(connection, params)?;
-        }
-
-        for message in output.messages {
-            let params = LogMessageParams {
-                typ: message.typ,
-                message: message.message,
-            };
-            send_notification::<lsp_types::notification::LogMessage>(connection, params)?;
-        }
-
+        publish_diagnostics(connection, output.diagnostics)?;
+        publish_log_messages(connection, output.messages)?;
         Ok(())
     }
 
@@ -683,21 +803,21 @@ impl ServerState {
     }
 
     fn handle_notification(&mut self, notification: Notification) -> HandlerOutput {
-        match notification.method.as_str() {
-            lsp_types::notification::Initialized::METHOD => HandlerOutput::default(),
-            lsp_types::notification::DidOpenTextDocument::METHOD => {
-                self.handle_typed_notification("didOpen", notification.params, Self::handle_open)
-            }
-            lsp_types::notification::DidChangeTextDocument::METHOD => self
-                .handle_typed_notification("didChange", notification.params, Self::handle_change),
-            lsp_types::notification::DidSaveTextDocument::METHOD => {
-                self.handle_typed_notification("didSave", notification.params, Self::handle_save)
-            }
-            lsp_types::notification::DidCloseTextDocument::METHOD => {
-                self.handle_typed_notification("didClose", notification.params, Self::handle_close)
-            }
-            other => self.unsupported_notification_output(other),
+        let method = notification.method.as_str();
+        if is_initialized_notification(method) {
+            return HandlerOutput::default();
         }
+        self.handle_document_notification(method, notification.params)
+            .unwrap_or_else(|| self.unsupported_notification_output(method))
+    }
+
+    fn handle_document_notification(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Option<HandlerOutput> {
+        let kind = document_notification_kind(method)?;
+        Some(kind.handle(self, params))
     }
 
     fn handle_typed_notification<T>(
@@ -729,31 +849,50 @@ impl ServerState {
 
 pub fn run() -> Result<()> {
     let (connection, io_threads) = Connection::stdio();
-    let (initialize_id, initialize_params) =
-        connection.initialize_start().map_err(protocol_error)?;
-    let params = serde_json::from_value::<InitializeParams>(initialize_params).map_err(|err| {
-        DieselGuardError::parse_error(format!("Invalid initialize params: {err}"))
-    })?;
-    let cwd = current_utf8_dir()?;
-    let root = select_workspace_root(&params, &cwd);
-    let initialize_result = initialize_result();
-    connection
-        .initialize_finish(
-            initialize_id,
-            serde_json::to_value(initialize_result)
-                .map_err(|err| DieselGuardError::parse_error(err.to_string()))?,
-        )
-        .map_err(protocol_error)?;
+    run_stdio_session(connection, io_threads)
+}
 
+fn run_stdio_session(connection: Connection, io_threads: IoThreads) -> Result<()> {
+    let root = initialize_connection(&connection)?;
     let exit_code = ServerState::new(root).run_loop(&connection)?;
     drop(connection);
     io_threads.join()?;
+    exit_with_code(exit_code);
+    Ok(())
+}
 
+fn initialize_connection(connection: &Connection) -> Result<Utf8PathBuf> {
+    let (initialize_id, params) = start_initialize(connection)?;
+    let cwd = current_utf8_dir()?;
+    let root = select_workspace_root(&params, &cwd);
+    finish_initialize(connection, initialize_id)?;
+    Ok(root)
+}
+
+fn start_initialize(connection: &Connection) -> Result<(RequestId, InitializeParams)> {
+    let (initialize_id, initialize_params) =
+        connection.initialize_start().map_err(protocol_error)?;
+    let params = decode_initialize_params(initialize_params)?;
+    Ok((initialize_id, params))
+}
+
+fn decode_initialize_params(value: serde_json::Value) -> Result<InitializeParams> {
+    serde_json::from_value(value)
+        .map_err(|err| DieselGuardError::parse_error(format!("Invalid initialize params: {err}")))
+}
+
+fn finish_initialize(connection: &Connection, initialize_id: RequestId) -> Result<()> {
+    let result = serde_json::to_value(initialize_result())
+        .map_err(|err| DieselGuardError::parse_error(err.to_string()))?;
+    connection
+        .initialize_finish(initialize_id, result)
+        .map_err(protocol_error)
+}
+
+fn exit_with_code(exit_code: i32) {
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
-
-    Ok(())
 }
 
 pub fn initialize_result() -> InitializeResult {
@@ -776,6 +915,37 @@ pub fn initialize_result() -> InitializeResult {
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
         }),
     }
+}
+
+fn is_initialized_notification(method: &str) -> bool {
+    method == lsp_types::notification::Initialized::METHOD
+}
+
+fn document_notification_kind(method: &str) -> Option<DocumentNotificationKind> {
+    document_notification_kinds()
+        .into_iter()
+        .find_map(|(candidate, kind)| (method == candidate).then_some(kind))
+}
+
+fn document_notification_kinds() -> [(&'static str, DocumentNotificationKind); 4] {
+    [
+        (
+            lsp_types::notification::DidOpenTextDocument::METHOD,
+            DocumentNotificationKind::Open,
+        ),
+        (
+            lsp_types::notification::DidChangeTextDocument::METHOD,
+            DocumentNotificationKind::Change,
+        ),
+        (
+            lsp_types::notification::DidSaveTextDocument::METHOD,
+            DocumentNotificationKind::Save,
+        ),
+        (
+            lsp_types::notification::DidCloseTextDocument::METHOD,
+            DocumentNotificationKind::Close,
+        ),
+    ]
 }
 
 pub fn select_workspace_root(params: &InitializeParams, current_dir: &Utf8Path) -> Utf8PathBuf {
@@ -813,6 +983,10 @@ fn saved_text_is_too_large(text: &str) -> bool {
     text.len() > usize::try_from(MAX_SAVED_DOCUMENT_BYTES).unwrap_or(usize::MAX)
 }
 
+fn live_text_is_too_large(text: &str) -> bool {
+    text.len() > MAX_LIVE_DOCUMENT_BYTES
+}
+
 fn checker_cache_key(config: &Config) -> std::result::Result<CheckerCacheKey, ConfigError> {
     Ok(CheckerCacheKey {
         config: format!("{config:?}"),
@@ -820,17 +994,44 @@ fn checker_cache_key(config: &Config) -> std::result::Result<CheckerCacheKey, Co
     })
 }
 
+fn checker_cache_key_with_lsp_fallback(
+    config: &mut Config,
+    cache_warnings: &mut Vec<String>,
+) -> std::result::Result<CheckerCacheKey, ConfigError> {
+    match checker_cache_key(config) {
+        Ok(key) => Ok(key),
+        Err(ConfigError::CustomChecksTooLarge { message }) => {
+            cache_warnings.push(format!(
+                "Custom checks are disabled for LSP diagnostics: {message}"
+            ));
+            config.custom_checks_dir = None;
+            checker_cache_key(config)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn custom_checks_signature(
     config: &Config,
 ) -> std::result::Result<Vec<CustomCheckFileSignature>, ConfigError> {
-    let Some(custom_checks_dir) = config.custom_checks_dir.as_deref() else {
+    let Some((custom_checks_dir, entries)) = custom_check_signature_entries(config) else {
         return Ok(Vec::new());
     };
+    collect_custom_checks_signature(custom_checks_dir, entries)
+}
 
+fn custom_check_signature_entries(config: &Config) -> Option<(&str, std::fs::ReadDir)> {
+    let custom_checks_dir = config.custom_checks_dir.as_deref()?;
     let Ok(entries) = std::fs::read_dir(Utf8Path::new(custom_checks_dir)) else {
-        return Ok(Vec::new());
+        return None;
     };
+    Some((custom_checks_dir, entries))
+}
 
+fn collect_custom_checks_signature(
+    custom_checks_dir: &str,
+    entries: std::fs::ReadDir,
+) -> std::result::Result<Vec<CustomCheckFileSignature>, ConfigError> {
     let mut signature = Vec::new();
     let mut total_hash_bytes = 0_u64;
 
@@ -894,37 +1095,59 @@ fn custom_check_file_signature(
 ) -> std::result::Result<CustomCheckFileSignature, ConfigError> {
     let metadata = std::fs::metadata(path).ok();
     let len = metadata.as_ref().map(std::fs::Metadata::len);
-    let content_hash = if len.is_some_and(|len| len <= MAX_CUSTOM_CHECK_SOURCE_BYTES) {
-        let Some((hash, bytes_read)) = file_content_hash(path)? else {
-            return Ok(CustomCheckFileSignature {
-                path: path.display().to_string(),
-                modified: metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.modified().ok()),
-                len,
-                content_hash: None,
-            });
-        };
-        let next_total = total_hash_bytes.saturating_add(bytes_read);
-        if next_total > MAX_LSP_CUSTOM_CHECK_TOTAL_SOURCE_BYTES {
-            return Err(custom_checks_too_large(format!(
-                "more than {MAX_LSP_CUSTOM_CHECK_TOTAL_SOURCE_BYTES} bytes of custom check content would be hashed"
-            )));
-        }
-        *total_hash_bytes = next_total;
-        Some(hash)
-    } else {
-        None
-    };
+    let content_hash = custom_check_signature_hash(path, len, total_hash_bytes)?;
+    Ok(custom_check_signature_from_parts(
+        path,
+        metadata.as_ref(),
+        len,
+        content_hash,
+    ))
+}
 
-    Ok(CustomCheckFileSignature {
+fn custom_check_signature_hash(
+    path: &std::path::Path,
+    len: Option<u64>,
+    total_hash_bytes: &mut u64,
+) -> std::result::Result<Option<u64>, ConfigError> {
+    if len.is_none_or(|len| len > MAX_CUSTOM_CHECK_SOURCE_BYTES) {
+        return Ok(None);
+    }
+
+    let Some((hash, bytes_read)) = file_content_hash(path)? else {
+        return Ok(None);
+    };
+    enforce_lsp_custom_check_hash_budget(total_hash_bytes, bytes_read)?;
+    Ok(Some(hash))
+}
+
+fn enforce_lsp_custom_check_hash_budget(
+    total_hash_bytes: &mut u64,
+    bytes_read: u64,
+) -> std::result::Result<(), ConfigError> {
+    let next_total = total_hash_bytes.saturating_add(bytes_read);
+    if next_total > MAX_LSP_CUSTOM_CHECK_TOTAL_SOURCE_BYTES {
+        return Err(custom_checks_too_large(format!(
+            "more than {MAX_LSP_CUSTOM_CHECK_TOTAL_SOURCE_BYTES} bytes of custom check content would be hashed"
+        )));
+    }
+    *total_hash_bytes = next_total;
+    Ok(())
+}
+
+fn custom_check_signature_from_parts(
+    path: &std::path::Path,
+    metadata: Option<&std::fs::Metadata>,
+    len: Option<u64>,
+    content_hash: Option<u64>,
+) -> CustomCheckFileSignature {
+    CustomCheckFileSignature {
         path: path.display().to_string(),
         modified: metadata
             .as_ref()
             .and_then(|metadata| metadata.modified().ok()),
         len,
         content_hash,
-    })
+    }
 }
 
 fn file_content_hash(
@@ -955,6 +1178,12 @@ fn custom_checks_too_large(message: String) -> ConfigError {
 }
 
 fn read_file_to_string_with_limit(path: &Utf8Path, limit: u64) -> std::io::Result<LimitedFileRead> {
+    ensure_regular_file(path)?;
+    let bytes = read_file_bytes_with_limit(path, limit)?;
+    limited_bytes_to_string(bytes, limit)
+}
+
+fn ensure_regular_file(path: &Utf8Path) -> std::io::Result<()> {
     let file_type = std::fs::symlink_metadata(path)?.file_type();
     if !file_type.is_file() {
         return Err(std::io::Error::new(
@@ -962,10 +1191,18 @@ fn read_file_to_string_with_limit(path: &Utf8Path, limit: u64) -> std::io::Resul
             "path is not a regular file",
         ));
     }
+    Ok(())
+}
+
+fn read_file_bytes_with_limit(path: &Utf8Path, limit: u64) -> std::io::Result<Vec<u8>> {
     let file = std::fs::File::open(path)?;
     let mut reader = file.take(limit.saturating_add(1));
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn limited_bytes_to_string(bytes: Vec<u8>, limit: u64) -> std::io::Result<LimitedFileRead> {
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
         return Ok(LimitedFileRead::TooLarge);
     }
@@ -982,28 +1219,48 @@ pub fn is_sql_file_uri(uri: &Uri) -> bool {
 }
 
 pub fn file_uri_to_path(uri: &Uri) -> Option<Utf8PathBuf> {
-    let raw = uri.as_str();
-    let rest = raw.strip_prefix("file://")?;
-    let path = if let Some(path) = rest.strip_prefix('/') {
-        format!("/{path}")
-    } else {
-        let slash = rest.find('/')?;
-        let authority = &rest[..slash];
-        if !authority.is_empty() && authority != "localhost" {
-            return None;
-        }
-        rest[slash..].to_string()
-    };
-    let path = path
-        .split(['?', '#'])
-        .next()
-        .map(percent_decode_utf8)
-        .and_then(std::result::Result::ok)?;
-
+    let rest = strip_file_uri(uri)?;
+    let path = file_uri_local_path(rest)?;
+    let path = path_without_query_or_fragment(&path);
+    let path = percent_decode_utf8(path).ok()?;
     #[cfg(windows)]
     let path = path.strip_prefix('/').unwrap_or(&path).to_string();
 
     Some(Utf8PathBuf::from(path))
+}
+
+fn strip_file_uri(uri: &Uri) -> Option<&str> {
+    uri.as_str().strip_prefix("file://")
+}
+
+fn file_uri_local_path(rest: &str) -> Option<String> {
+    if let Some(path) = rest.strip_prefix('/') {
+        return Some(format!("/{path}"));
+    }
+
+    let slash = rest.find('/')?;
+    let authority = &rest[..slash];
+    validate_file_uri_authority(authority)?;
+    Some(rest[slash..].to_string())
+}
+
+fn validate_file_uri_authority(authority: &str) -> Option<()> {
+    (authority.is_empty() || authority == "localhost").then_some(())
+}
+
+fn path_without_query_or_fragment(path: &str) -> &str {
+    path.split(['?', '#']).next().unwrap_or(path)
+}
+
+fn check_live_sql(
+    checker: &SafetyChecker,
+    uri: &Uri,
+    text: &str,
+) -> Result<(ViolationList, Vec<String>)> {
+    file_uri_to_path(uri).map_or_else(
+        || checker.check_sql_with_warnings(text),
+        |path| checker.check_file_sql_with_warnings(&path, text),
+    )
 }
 
 pub fn violations_to_diagnostics(text: &str, violations: &ViolationList) -> Vec<Diagnostic> {
@@ -1011,21 +1268,10 @@ pub fn violations_to_diagnostics(text: &str, violations: &ViolationList) -> Vec<
     violations
         .iter()
         .map(|(line, violation)| {
-            let zero_indexed_line = u32::try_from(line.saturating_sub(1)).unwrap_or(u32::MAX);
-            let line_text = lines
-                .get(line.saturating_sub(1))
-                .copied()
-                .unwrap_or_default();
-            let severity = match violation.severity {
-                Severity::Error => DiagnosticSeverity::ERROR,
-                Severity::Warning => DiagnosticSeverity::WARNING,
-            };
-            let code = (!violation.check_name.is_empty())
-                .then(|| NumberOrString::String(violation.check_name.clone()));
             Diagnostic::new(
-                line_range(zero_indexed_line, line_text),
-                Some(severity),
-                code,
+                diagnostic_range(*line, &lines),
+                Some(diagnostic_severity(violation.severity)),
+                diagnostic_code(&violation.check_name),
                 Some(DIAGNOSTIC_SOURCE.to_string()),
                 diagnostic_message(&violation.problem, &violation.safe_alternative),
                 None,
@@ -1033,6 +1279,26 @@ pub fn violations_to_diagnostics(text: &str, violations: &ViolationList) -> Vec<
             )
         })
         .collect()
+}
+
+fn diagnostic_range(line: usize, lines: &[&str]) -> Range {
+    let zero_indexed_line = u32::try_from(line.saturating_sub(1)).unwrap_or(u32::MAX);
+    let line_text = lines
+        .get(line.saturating_sub(1))
+        .copied()
+        .unwrap_or_default();
+    line_range(zero_indexed_line, line_text)
+}
+
+fn diagnostic_severity(severity: Severity) -> DiagnosticSeverity {
+    match severity {
+        Severity::Error => DiagnosticSeverity::ERROR,
+        Severity::Warning => DiagnosticSeverity::WARNING,
+    }
+}
+
+fn diagnostic_code(check_name: &str) -> Option<NumberOrString> {
+    (!check_name.is_empty()).then(|| NumberOrString::String(check_name.to_string()))
 }
 
 fn parse_error_event(
@@ -1107,7 +1373,7 @@ fn is_parse_error(err: &DieselGuardError) -> bool {
 }
 
 fn byte_offset_to_position(text: &str, offset: usize) -> Position {
-    let offset = offset.min(text.len());
+    let offset = clamped_byte_offset(text, offset);
     let mut line = 0_u32;
     let mut line_start = 0_usize;
 
@@ -1115,17 +1381,28 @@ fn byte_offset_to_position(text: &str, offset: usize) -> Position {
         if idx >= offset {
             break;
         }
-        if ch == '\n' {
-            line = line.saturating_add(1);
-            line_start = idx + ch.len_utf8();
-        }
+        advance_position_for_char(ch, idx, &mut line, &mut line_start);
     }
 
     Position {
         line,
-        character: u32::try_from(text[line_start..offset].encode_utf16().count())
-            .unwrap_or(u32::MAX),
+        character: utf16_character_offset(text, line_start, offset),
     }
+}
+
+fn clamped_byte_offset(text: &str, offset: usize) -> usize {
+    offset.min(text.len())
+}
+
+fn advance_position_for_char(ch: char, idx: usize, line: &mut u32, line_start: &mut usize) {
+    if ch == '\n' {
+        *line = line.saturating_add(1);
+        *line_start = idx + ch.len_utf8();
+    }
+}
+
+fn utf16_character_offset(text: &str, line_start: usize, offset: usize) -> u32 {
+    u32::try_from(text[line_start..offset].encode_utf16().count()).unwrap_or(u32::MAX)
 }
 
 fn percent_decode_utf8(input: &str) -> std::result::Result<String, ()> {
@@ -1135,11 +1412,7 @@ fn percent_decode_utf8(input: &str) -> std::result::Result<String, ()> {
 
     while index < bytes.len() {
         if bytes[index] == b'%' {
-            let Some(hex) = bytes.get(index + 1..index + 3) else {
-                return Err(());
-            };
-            let hex = std::str::from_utf8(hex).map_err(|_| ())?;
-            decoded.push(u8::from_str_radix(hex, 16).map_err(|_| ())?);
+            decoded.push(percent_encoded_byte(bytes, index)?);
             index += 3;
         } else {
             decoded.push(bytes[index]);
@@ -1148,6 +1421,12 @@ fn percent_decode_utf8(input: &str) -> std::result::Result<String, ()> {
     }
 
     String::from_utf8(decoded).map_err(|_| ())
+}
+
+fn percent_encoded_byte(bytes: &[u8], index: usize) -> std::result::Result<u8, ()> {
+    let hex = bytes.get(index + 1..index + 3).ok_or(())?;
+    let hex = std::str::from_utf8(hex).map_err(|_| ())?;
+    u8::from_str_radix(hex, 16).map_err(|_| ())
 }
 
 fn current_utf8_dir() -> Result<Utf8PathBuf> {
@@ -1168,6 +1447,29 @@ where
         .sender
         .send(Notification::new(N::METHOD.to_string(), params).into())
         .map_err(|err| DieselGuardError::parse_error(err.to_string()))
+}
+
+fn publish_diagnostics(connection: &Connection, diagnostics: Vec<DiagnosticEvent>) -> Result<()> {
+    for diagnostic in diagnostics {
+        let params = PublishDiagnosticsParams::new(
+            diagnostic.uri,
+            diagnostic.diagnostics,
+            diagnostic.version,
+        );
+        send_notification::<lsp_types::notification::PublishDiagnostics>(connection, params)?;
+    }
+    Ok(())
+}
+
+fn publish_log_messages(connection: &Connection, messages: Vec<MessageEvent>) -> Result<()> {
+    for message in messages {
+        let params = LogMessageParams {
+            typ: message.typ,
+            message: message.message,
+        };
+        send_notification::<lsp_types::notification::LogMessage>(connection, params)?;
+    }
+    Ok(())
 }
 
 fn send_response(connection: &Connection, response: Response) -> Result<()> {
@@ -1252,6 +1554,28 @@ mod tests {
     fn file_uri_to_path_decodes_percent_encoded_paths() {
         let path = file_uri_to_path(&uri("file:///tmp/space%20dir/up.sql")).unwrap();
         assert_eq!(path.as_str(), "/tmp/space dir/up.sql");
+    }
+
+    #[test]
+    fn file_uri_to_path_accepts_localhost_and_strips_query_fragment() {
+        let path = file_uri_to_path(&uri("file://localhost/tmp/up.sql?rev=1#section")).unwrap();
+        assert_eq!(path.as_str(), "/tmp/up.sql");
+    }
+
+    #[test]
+    fn file_uri_to_path_rejects_remote_authority() {
+        assert!(file_uri_to_path(&uri("file://db.example/tmp/up.sql")).is_none());
+    }
+
+    #[test]
+    fn file_uri_to_path_rejects_invalid_percent_encoding() {
+        assert!(percent_decode_utf8("/tmp/bad%2.sql").is_err());
+        assert!(percent_decode_utf8("/tmp/bad%GG.sql").is_err());
+    }
+
+    #[test]
+    fn file_uri_to_path_rejects_invalid_utf8_escape() {
+        assert!(file_uri_to_path(&uri("file:///tmp/%FF.sql")).is_none());
     }
 
     #[test]
@@ -1411,6 +1735,76 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn byte_offset_to_position_tracks_multiline_utf16_offsets() {
+        let text = "SELECT 1;\nSELECT '😀';";
+        let offset = text.find('😀').unwrap() + '😀'.len_utf8();
+        let position = byte_offset_to_position(text, offset);
+
+        assert_eq!(position.line, 1);
+        assert_eq!(
+            position.character,
+            u32::try_from("SELECT '😀".encode_utf16().count()).unwrap()
+        );
+    }
+
+    #[test]
+    fn diagnostic_mapping_omits_empty_check_name() {
+        let violation = crate::Violation::new("op", "problem", "");
+        let diagnostics = violations_to_diagnostics("SELECT 1;", &vec![(1, violation)]);
+
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(diagnostics[0].code.is_none());
+        assert_eq!(diagnostics[0].message, "problem");
+    }
+
+    #[test]
+    fn diagnostic_mapping_handles_out_of_range_line() {
+        let violation = crate::Violation::new("op", "problem", "safe");
+        let diagnostics = violations_to_diagnostics("SELECT 1;", &vec![(99, violation)]);
+
+        assert_eq!(diagnostics[0].range.start.line, 98);
+        assert_eq!(diagnostics[0].range.end.character, 0);
+    }
+
+    #[test]
+    fn apply_output_publishes_diagnostics_before_logs() {
+        let (server, client) = Connection::memory();
+        let uri = uri("file:///tmp/output.sql");
+        let output = HandlerOutput {
+            diagnostics: vec![DiagnosticEvent {
+                uri: uri.clone(),
+                diagnostics: Vec::new(),
+                version: Some(4),
+            }],
+            messages: vec![MessageEvent {
+                typ: MessageType::INFO,
+                message: "ready".to_string(),
+            }],
+        };
+
+        ServerState::apply_output(&server, output).unwrap();
+
+        let Message::Notification(first) = client.receiver.try_recv().unwrap() else {
+            panic!("expected diagnostics notification");
+        };
+        assert_eq!(
+            first.method,
+            lsp_types::notification::PublishDiagnostics::METHOD
+        );
+        let params: PublishDiagnosticsParams = serde_json::from_value(first.params).unwrap();
+        assert_eq!(params.uri, uri);
+        assert_eq!(params.version, Some(4));
+
+        let Message::Notification(second) = client.receiver.try_recv().unwrap() else {
+            panic!("expected log notification");
+        };
+        assert_eq!(second.method, lsp_types::notification::LogMessage::METHOD);
+        let params: LogMessageParams = serde_json::from_value(second.params).unwrap();
+        assert_eq!(params.typ, MessageType::INFO);
+        assert_eq!(params.message, "ready");
     }
 
     #[test]
@@ -1603,6 +1997,21 @@ mod tests {
                 .message
                 .contains("Skipping live diagnostics")
         );
+    }
+
+    #[test]
+    fn live_diagnostics_precheck_clears_non_sql_if_published() {
+        let root = temp_root();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+        let uri = uri("file:///tmp/readme.txt");
+        state.track_published_uri(&uri);
+
+        let output = state.run_live_diagnostics(uri, "not sql", Some(8));
+
+        assert_eq!(output.diagnostics.len(), 1);
+        assert!(output.diagnostics[0].diagnostics.is_empty());
+        assert_eq!(output.diagnostics[0].version, Some(8));
     }
 
     #[test]
@@ -2102,6 +2511,25 @@ mod tests {
     }
 
     #[test]
+    fn run_loop_ignores_responses_and_returns_zero_when_channel_closes() {
+        let root = temp_root();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+        let (server, client) = Connection::memory();
+        let lsp_server::Connection { sender, .. } = client;
+
+        sender
+            .send(Message::Response(Response::new_ok(
+                RequestId::from(11),
+                json!({"ignored": true}),
+            )))
+            .unwrap();
+        drop(sender);
+
+        assert_eq!(state.run_loop(&server).unwrap(), 0);
+    }
+
+    #[test]
     fn handle_notification_dispatches_did_open() {
         let root = temp_root();
         let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
@@ -2122,6 +2550,79 @@ mod tests {
 
         assert!(output.messages.is_empty());
         assert_eq!(state.document(&uri).unwrap().version, Some(3));
+    }
+
+    #[test]
+    fn document_notification_kind_maps_supported_methods() {
+        assert_eq!(
+            document_notification_kind(lsp_types::notification::DidOpenTextDocument::METHOD),
+            Some(DocumentNotificationKind::Open)
+        );
+        assert_eq!(
+            document_notification_kind(lsp_types::notification::DidChangeTextDocument::METHOD),
+            Some(DocumentNotificationKind::Change)
+        );
+        assert_eq!(
+            document_notification_kind(lsp_types::notification::DidSaveTextDocument::METHOD),
+            Some(DocumentNotificationKind::Save)
+        );
+        assert_eq!(
+            document_notification_kind(lsp_types::notification::DidCloseTextDocument::METHOD),
+            Some(DocumentNotificationKind::Close)
+        );
+        assert_eq!(document_notification_kind("workspace/unknown"), None);
+    }
+
+    #[test]
+    fn handle_document_notification_dispatches_change_save_and_close() {
+        let root = temp_root();
+        let path = root.path().join("notify.sql");
+        std::fs::write(&path, "SELECT 1;").unwrap();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+        let uri = uri(&format!("file://{}", path.display()));
+
+        let change_output = state
+            .handle_document_notification(
+                lsp_types::notification::DidChangeTextDocument::METHOD,
+                json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 4 },
+                    "contentChanges": [{ "text": "SELECT 2;" }]
+                }),
+            )
+            .unwrap();
+        assert!(change_output.messages.is_empty());
+        assert_eq!(state.document(&uri).unwrap().version, Some(4));
+
+        let save_output = state
+            .handle_document_notification(
+                lsp_types::notification::DidSaveTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri.to_string() } }),
+            )
+            .unwrap();
+        assert!(!save_output.diagnostics.is_empty());
+
+        let close_output = state
+            .handle_document_notification(
+                lsp_types::notification::DidCloseTextDocument::METHOD,
+                json!({ "textDocument": { "uri": uri.to_string() } }),
+            )
+            .unwrap();
+        assert!(state.document(&uri).is_none());
+        assert_eq!(close_output.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn handle_document_notification_returns_none_for_unknown_method() {
+        let root = temp_root();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+
+        assert!(
+            state
+                .handle_document_notification("workspace/didChangeConfiguration", json!({}))
+                .is_none()
+        );
     }
 
     #[test]

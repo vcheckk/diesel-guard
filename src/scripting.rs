@@ -18,6 +18,18 @@ struct CustomCheckFile {
     stem: String,
 }
 
+struct ScriptInputs {
+    node: Dynamic,
+    config: Dynamic,
+    ctx: Dynamic,
+}
+
+struct CustomCheckLoadState {
+    checks: Vec<Box<dyn Check>>,
+    errors: Vec<ScriptError>,
+    total_source_bytes: u64,
+}
+
 enum ScriptSource {
     Source(String, u64),
     TooLarge,
@@ -54,6 +66,81 @@ impl CustomCheck {
             "This is likely a diesel-guard bug. Please report it.",
         )]
     }
+
+    fn script_scope(
+        node: &NodeEnum,
+        config: &Config,
+        ctx: &MigrationContext,
+    ) -> std::result::Result<rhai::Scope<'static>, String> {
+        script_inputs(node, config, ctx).map(script_scope_from_inputs)
+    }
+}
+
+fn script_inputs(
+    node: &NodeEnum,
+    config: &Config,
+    ctx: &MigrationContext,
+) -> std::result::Result<ScriptInputs, String> {
+    let node = script_node_input(node)?;
+    script_inputs_with_node(node, config, ctx)
+}
+
+fn script_inputs_with_node(
+    node: Dynamic,
+    config: &Config,
+    ctx: &MigrationContext,
+) -> std::result::Result<ScriptInputs, String> {
+    let config = script_config_input(config)?;
+    script_inputs_with_node_config(node, config, ctx)
+}
+
+fn script_inputs_with_node_config(
+    node: Dynamic,
+    config: Dynamic,
+    ctx: &MigrationContext,
+) -> std::result::Result<ScriptInputs, String> {
+    Ok(ScriptInputs {
+        node,
+        config,
+        ctx: script_context_input(ctx)?,
+    })
+}
+
+fn script_node_input(node: &NodeEnum) -> std::result::Result<Dynamic, String> {
+    rhai::serde::to_dynamic(node).map_err(|err| err.to_string())
+}
+
+fn script_config_input(config: &Config) -> std::result::Result<Dynamic, String> {
+    rhai::serde::to_dynamic(config).map_err(|err| err.to_string())
+}
+
+fn script_context_input(ctx: &MigrationContext) -> std::result::Result<Dynamic, String> {
+    rhai::serde::to_dynamic(ctx).map_err(|err| err.to_string())
+}
+
+fn script_scope_from_inputs(inputs: ScriptInputs) -> rhai::Scope<'static> {
+    let mut scope = rhai::Scope::new();
+    scope.push("node", inputs.node);
+    scope.push("config", inputs.config);
+    scope.push("ctx", inputs.ctx);
+    scope
+}
+
+impl CustomCheck {
+    fn evaluate_custom_check(&self, scope: &mut rhai::Scope<'_>) -> Vec<Violation> {
+        match self.engine.eval_ast_with_scope::<Dynamic>(scope, &self.ast) {
+            Ok(result) => parse_script_result(&self.name, result),
+            Err(err) => vec![self.runtime_error_violation(&err)],
+        }
+    }
+
+    fn runtime_error_violation(&self, err: &dyn std::fmt::Display) -> Violation {
+        Violation::new(
+            format!("SCRIPT ERROR: {}", self.name),
+            format!("Runtime error in custom check '{}': {err}", self.name),
+            "Fix the custom check script to eliminate the runtime error.",
+        )
+    }
 }
 
 impl Check for CustomCheck {
@@ -80,40 +167,11 @@ impl Check for CustomCheck {
     }
 
     fn check(&self, node: &NodeEnum, config: &Config, ctx: &MigrationContext) -> Vec<Violation> {
-        // Serialize the pg_query node to a Rhai Dynamic value via serde
-        let dynamic_node = match rhai::serde::to_dynamic(node) {
-            Ok(d) => d,
-            Err(e) => return self.internal_error(&e),
+        let mut scope = match Self::script_scope(node, config, ctx) {
+            Ok(scope) => scope,
+            Err(err) => return self.internal_error(&err),
         };
-
-        let dynamic_config = match rhai::serde::to_dynamic(config) {
-            Ok(d) => d,
-            Err(e) => return self.internal_error(&e),
-        };
-
-        let dynamic_ctx = match rhai::serde::to_dynamic(ctx) {
-            Ok(d) => d,
-            Err(e) => return self.internal_error(&e),
-        };
-
-        let mut scope = rhai::Scope::new();
-        scope.push("node", dynamic_node);
-        scope.push("config", dynamic_config);
-        scope.push("ctx", dynamic_ctx);
-
-        match self
-            .engine
-            .eval_ast_with_scope::<Dynamic>(&mut scope, &self.ast)
-        {
-            Ok(result) => parse_script_result(&self.name, result),
-            Err(e) => {
-                vec![Violation::new(
-                    format!("SCRIPT ERROR: {}", self.name),
-                    format!("Runtime error in custom check '{}': {e}", self.name),
-                    "Fix the custom check script to eliminate the runtime error.",
-                )]
-            }
-        }
+        self.evaluate_custom_check(&mut scope)
     }
 }
 
@@ -129,66 +187,91 @@ fn parse_script_result(check_name: &str, result: Dynamic) -> Vec<Violation> {
     }
 
     if result.is_map() {
-        return match map_to_violation(check_name, result) {
-            Some(v) => vec![v],
-            None => vec![],
-        };
+        return single_script_violation(check_name, result);
     }
 
     if result.is_array() {
-        return result
-            .into_array()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| map_to_violation(check_name, v))
-            .collect();
+        return array_script_violations(check_name, result);
     }
 
-    vec![Violation::new(
+    vec![invalid_script_result_violation(check_name, &result)]
+}
+
+fn single_script_violation(check_name: &str, result: Dynamic) -> Vec<Violation> {
+    match map_to_violation(check_name, result) {
+        Some(violation) => vec![violation],
+        None => vec![],
+    }
+}
+
+fn array_script_violations(check_name: &str, result: Dynamic) -> Vec<Violation> {
+    result
+        .into_array()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| map_to_violation(check_name, value))
+        .collect()
+}
+
+fn invalid_script_result_violation(check_name: &str, result: &Dynamic) -> Violation {
+    Violation::new(
         format!("SCRIPT ERROR: {check_name}"),
         format!(
             "Custom check returned {}, expected (), map, or array",
             result.type_name()
         ),
         "Fix the custom check script to return a valid type.",
-    )]
+    )
 }
 
 /// Convert a Rhai map Dynamic to a Violation.
 fn map_to_violation(check_name: &str, value: Dynamic) -> Option<Violation> {
     let map = value.try_cast::<rhai::Map>()?;
+    violation_from_map_fields(&map).or_else(|| Some(invalid_map_violation(check_name, &map)))
+}
 
-    let operation = map
-        .get("operation")
-        .and_then(|v| v.clone().into_string().ok());
-    let problem = map
-        .get("problem")
-        .and_then(|v| v.clone().into_string().ok());
-    let safe_alternative = map
-        .get("safe_alternative")
-        .and_then(|v| v.clone().into_string().ok());
+fn violation_from_map_fields(map: &rhai::Map) -> Option<Violation> {
+    let operation = string_map_field(map, "operation");
+    let problem = string_map_field(map, "problem");
+    let safe_alternative = string_map_field(map, "safe_alternative");
 
-    if let (Some(op), Some(prob), Some(alt)) = (operation, problem, safe_alternative) {
-        Some(Violation::new(op, prob, alt))
-    } else {
-        let mut issues = Vec::new();
-        for key in &["operation", "problem", "safe_alternative"] {
-            match map.get(*key) {
-                None => issues.push(format!("'{key}' is missing")),
-                Some(v) if v.clone().into_string().is_err() => {
-                    issues.push(format!("'{key}' must be a string (got {})", v.type_name()));
-                }
-                _ => {}
-            }
-        }
-        Some(Violation::new(
-            format!("SCRIPT ERROR: {check_name}"),
-            format!(
-                "Custom check returned an invalid map: {}",
-                issues.join(", ")
-            ),
-            "Fix the custom check script to return all three required string keys.",
-        ))
+    match (operation, problem, safe_alternative) {
+        (Some(op), Some(prob), Some(alt)) => Some(Violation::new(op, prob, alt)),
+        _ => None,
+    }
+}
+
+fn string_map_field(map: &rhai::Map, key: &str) -> Option<String> {
+    map.get(key)
+        .and_then(|value| value.clone().into_string().ok())
+}
+
+fn invalid_map_violation(check_name: &str, map: &rhai::Map) -> Violation {
+    Violation::new(
+        format!("SCRIPT ERROR: {check_name}"),
+        format!(
+            "Custom check returned an invalid map: {}",
+            invalid_map_issues(map).join(", ")
+        ),
+        "Fix the custom check script to return all three required string keys.",
+    )
+}
+
+fn invalid_map_issues(map: &rhai::Map) -> Vec<String> {
+    ["operation", "problem", "safe_alternative"]
+        .into_iter()
+        .filter_map(|key| invalid_map_issue(map, key))
+        .collect()
+}
+
+fn invalid_map_issue(map: &rhai::Map, key: &str) -> Option<String> {
+    match map.get(key) {
+        None => Some(format!("'{key}' is missing")),
+        Some(value) if value.clone().into_string().is_err() => Some(format!(
+            "'{key}' must be a string (got {})",
+            value.type_name()
+        )),
+        _ => None,
     }
 }
 
@@ -270,69 +353,150 @@ pub fn load_custom_checks(
     dir: &Utf8Path,
     config: &crate::config::Config,
 ) -> (Vec<Box<dyn Check>>, Vec<ScriptError>) {
-    let mut checks: Vec<Box<dyn Check>> = Vec::new();
     let engine = Arc::new(create_engine());
-    let (entries, mut errors) = discover_custom_check_files(dir);
-    let mut total_source_bytes = 0_u64;
+    let (entries, errors) = discover_custom_check_files(dir);
+    let state = load_custom_check_entries(dir, config, &engine, entries, errors);
+    (state.checks, state.errors)
+}
 
+fn load_custom_check_entries(
+    dir: &Utf8Path,
+    config: &Config,
+    engine: &Arc<Engine>,
+    entries: Vec<CustomCheckFile>,
+    errors: Vec<ScriptError>,
+) -> CustomCheckLoadState {
+    let mut state = CustomCheckLoadState {
+        checks: Vec::new(),
+        errors,
+        total_source_bytes: 0,
+    };
     for entry in entries {
-        // Skip scripts disabled via config
-        if !config.is_check_enabled(&entry.stem) {
-            continue;
-        }
-
-        let source = match read_script_source(&entry.path) {
-            Ok(ScriptSource::Source(source, bytes_read)) => {
-                let next_total = total_source_bytes.saturating_add(bytes_read);
-                if next_total > MAX_CUSTOM_CHECK_TOTAL_SOURCE_BYTES {
-                    errors.push(ScriptError {
-                        file: dir.to_string(),
-                        message: format!(
-                            "Custom check scripts are larger than {MAX_CUSTOM_CHECK_TOTAL_SOURCE_BYTES} bytes in total"
-                        ),
-                    });
-                    break;
-                }
-                total_source_bytes = next_total;
-                source
-            }
-            Ok(ScriptSource::TooLarge) => {
-                errors.push(ScriptError {
-                    file: entry.path.display().to_string(),
-                    message: format!(
-                        "Custom check script is larger than {MAX_CUSTOM_CHECK_SOURCE_BYTES} bytes"
-                    ),
-                });
-                continue;
-            }
-            Err(e) => {
-                errors.push(ScriptError {
-                    file: entry.path.display().to_string(),
-                    message: format!("Failed to read: {e}"),
-                });
-                continue;
-            }
-        };
-
-        match engine.compile(&source) {
-            Ok(ast) => {
-                checks.push(Box::new(CustomCheck {
-                    name: entry.stem,
-                    engine: Arc::clone(&engine),
-                    ast,
-                    path: entry.path.display().to_string(),
-                }));
-            }
-            Err(e) => {
-                errors.push(ScriptError {
-                    file: entry.path.display().to_string(),
-                    message: format!("Compilation error: {e}"),
-                });
-            }
+        if !load_custom_check_entry(dir, config, engine, entry, &mut state) {
+            break;
         }
     }
+    state
+}
 
-    (checks, errors)
+fn load_custom_check_entry(
+    dir: &Utf8Path,
+    config: &Config,
+    engine: &Arc<Engine>,
+    entry: CustomCheckFile,
+    state: &mut CustomCheckLoadState,
+) -> bool {
+    if !config.is_check_enabled(&entry.stem) {
+        return true;
+    }
+
+    let Some(source) = script_source_for_entry(dir, &entry, state) else {
+        return state.total_source_bytes <= MAX_CUSTOM_CHECK_TOTAL_SOURCE_BYTES;
+    };
+    compile_custom_check(engine, entry, &source, &mut state.checks, &mut state.errors);
+    true
+}
+
+fn script_source_for_entry(
+    dir: &Utf8Path,
+    entry: &CustomCheckFile,
+    state: &mut CustomCheckLoadState,
+) -> Option<String> {
+    match read_script_source(&entry.path) {
+        Ok(ScriptSource::Source(source, bytes_read)) => {
+            add_script_source_bytes(dir, bytes_read, state).then_some(source)
+        }
+        Ok(ScriptSource::TooLarge) => {
+            push_oversized_script_error(entry, &mut state.errors);
+            None
+        }
+        Err(error) => {
+            push_script_read_error(entry, &error, &mut state.errors);
+            None
+        }
+    }
+}
+
+fn add_script_source_bytes(
+    dir: &Utf8Path,
+    bytes_read: u64,
+    state: &mut CustomCheckLoadState,
+) -> bool {
+    let next_total = state.total_source_bytes.saturating_add(bytes_read);
+    if next_total > MAX_CUSTOM_CHECK_TOTAL_SOURCE_BYTES {
+        push_total_script_size_error(dir, &mut state.errors);
+        state.total_source_bytes = next_total;
+        return false;
+    }
+    state.total_source_bytes = next_total;
+    true
+}
+
+fn push_total_script_size_error(dir: &Utf8Path, errors: &mut Vec<ScriptError>) {
+    errors.push(ScriptError {
+        file: dir.to_string(),
+        message: format!(
+            "Custom check scripts are larger than {MAX_CUSTOM_CHECK_TOTAL_SOURCE_BYTES} bytes in total"
+        ),
+    });
+}
+
+fn push_oversized_script_error(entry: &CustomCheckFile, errors: &mut Vec<ScriptError>) {
+    errors.push(ScriptError {
+        file: entry.path.display().to_string(),
+        message: format!(
+            "Custom check script is larger than {MAX_CUSTOM_CHECK_SOURCE_BYTES} bytes"
+        ),
+    });
+}
+
+fn push_script_read_error(
+    entry: &CustomCheckFile,
+    error: &std::io::Error,
+    errors: &mut Vec<ScriptError>,
+) {
+    errors.push(ScriptError {
+        file: entry.path.display().to_string(),
+        message: format!("Failed to read: {error}"),
+    });
+}
+
+fn compile_custom_check(
+    engine: &Arc<Engine>,
+    entry: CustomCheckFile,
+    source: &str,
+    checks: &mut Vec<Box<dyn Check>>,
+    errors: &mut Vec<ScriptError>,
+) {
+    match engine.compile(source) {
+        Ok(ast) => push_compiled_custom_check(engine, entry, ast, checks),
+        Err(error) => push_script_compile_error(&entry, &error, errors),
+    }
+}
+
+fn push_compiled_custom_check(
+    engine: &Arc<Engine>,
+    entry: CustomCheckFile,
+    ast: AST,
+    checks: &mut Vec<Box<dyn Check>>,
+) {
+    checks.push(Box::new(CustomCheck {
+        name: entry.stem,
+        engine: Arc::clone(engine),
+        ast,
+        path: entry.path.display().to_string(),
+    }));
+}
+
+fn push_script_compile_error(
+    entry: &CustomCheckFile,
+    error: &rhai::ParseError,
+    errors: &mut Vec<ScriptError>,
+) {
+    errors.push(ScriptError {
+        file: entry.path.display().to_string(),
+        message: format!("Compilation error: {error}"),
+    });
 }
 
 fn discover_custom_check_files(dir: &Utf8Path) -> (Vec<CustomCheckFile>, Vec<ScriptError>) {
@@ -358,20 +522,34 @@ fn collect_custom_check_files(
     let mut files = Vec::new();
     let mut errors = Vec::new();
     for (index, entry) in read_dir.enumerate() {
-        if !custom_check_entry_limit_allows(dir, index, &mut errors) {
-            break;
-        }
-
-        let Some(file) = custom_check_file_from_entry(dir, entry, &mut errors) else {
-            continue;
-        };
-        if !push_custom_check_file(dir, file, &mut files, &mut errors) {
+        if !process_custom_check_dir_entry(dir, index, entry, &mut files, &mut errors) {
             break;
         }
     }
 
-    files.sort_by(|left, right| left.path.file_name().cmp(&right.path.file_name()));
+    sort_custom_check_files(&mut files);
     (files, errors)
+}
+
+fn process_custom_check_dir_entry(
+    dir: &Utf8Path,
+    index: usize,
+    entry: std::io::Result<std::fs::DirEntry>,
+    files: &mut Vec<CustomCheckFile>,
+    errors: &mut Vec<ScriptError>,
+) -> bool {
+    if !custom_check_entry_limit_allows(dir, index, errors) {
+        return false;
+    }
+
+    let Some(file) = custom_check_file_from_entry(dir, entry, errors) else {
+        return true;
+    };
+    push_custom_check_file(dir, file, files, errors)
+}
+
+fn sort_custom_check_files(files: &mut [CustomCheckFile]) {
+    files.sort_by(|left, right| left.path.file_name().cmp(&right.path.file_name()));
 }
 
 fn custom_check_entry_limit_allows(
@@ -978,6 +1156,74 @@ mod tests {
         assert_eq!(names, vec!["alpha.rhai", "zeta.rhai"]);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("not a regular file"));
+    }
+
+    #[test]
+    fn test_process_custom_check_dir_entry_allows_non_rhai_entries() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let dir_path = Utf8Path::from_path(dir.path()).unwrap();
+        fs::write(dir.path().join("notes.txt"), "return;").unwrap();
+        let entry = fs::read_dir(dir.path()).unwrap().next().unwrap();
+        let mut files = Vec::new();
+        let mut errors = Vec::new();
+
+        assert!(process_custom_check_dir_entry(
+            dir_path,
+            0,
+            entry,
+            &mut files,
+            &mut errors
+        ));
+        assert!(files.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_process_custom_check_dir_entry_stops_at_file_limit() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let dir_path = Utf8Path::from_path(dir.path()).unwrap();
+        fs::write(dir.path().join("extra.rhai"), "return;").unwrap();
+        let entry = fs::read_dir(dir.path()).unwrap().next().unwrap();
+        let mut files = (0..MAX_CUSTOM_CHECK_FILES)
+            .map(|index| CustomCheckFile {
+                path: PathBuf::from(format!("check_{index}.rhai")),
+                stem: format!("check_{index}"),
+            })
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+
+        assert!(!process_custom_check_dir_entry(
+            dir_path,
+            0,
+            entry,
+            &mut files,
+            &mut errors
+        ));
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("more than"));
+    }
+
+    #[test]
+    fn test_parse_script_result_rejects_scalar() {
+        let violations = parse_script_result("scalar_check", Dynamic::from(42_i64));
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].operation, "SCRIPT ERROR: scalar_check");
+        assert!(violations[0].problem.contains("expected (), map, or array"));
+    }
+
+    #[test]
+    fn test_array_script_violations_filters_non_maps() {
+        let mut valid = rhai::Map::new();
+        valid.insert("operation".into(), Dynamic::from("op"));
+        valid.insert("problem".into(), Dynamic::from("problem"));
+        valid.insert("safe_alternative".into(), Dynamic::from("safe"));
+        let result = Dynamic::from_array(vec![Dynamic::from(7_i64), Dynamic::from_map(valid)]);
+
+        let violations = parse_script_result("array_check", result);
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].operation, "op");
     }
 
     #[test]
