@@ -89,10 +89,13 @@ framework = "sqlx"
 
 Relative `custom_checks_dir` values are resolved under the selected workspace
 root. Custom Rhai checks configured by the workspace run as part of editor
-diagnostics, the same as they do for the CLI. The compiled checker is cached
-between diagnostic passes and refreshed when the config or custom check files
-change. Review `diesel-guard.toml` before enabling the LSP automatically for
-untrusted repositories.
+diagnostics when they fit the LSP safety limits. The editor server uses tighter
+limits than the CLI: at most 16 custom check files and 256 KiB of custom check
+source are loaded for LSP diagnostics. If a workspace exceeds those limits,
+custom checks are disabled for that LSP session and built-in diagnostics keep
+running. The compiled checker is cached between diagnostic passes and refreshed
+when the config or custom check files change. Review `diesel-guard.toml` before
+enabling the LSP automatically for untrusted repositories.
 
 The server advertises full text synchronization and save notifications. It does
 not scan unopened files or promise incremental text sync.

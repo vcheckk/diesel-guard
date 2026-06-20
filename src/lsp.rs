@@ -1,9 +1,6 @@
 use crate::config::{Config, ConfigError};
 use crate::error::{DieselGuardError, Result};
-use crate::scripting::{
-    MAX_CUSTOM_CHECK_DIR_ENTRIES, MAX_CUSTOM_CHECK_FILES, MAX_CUSTOM_CHECK_SOURCE_BYTES,
-    MAX_CUSTOM_CHECK_TOTAL_SOURCE_BYTES,
-};
+use crate::scripting::{MAX_CUSTOM_CHECK_DIR_ENTRIES, MAX_CUSTOM_CHECK_SOURCE_BYTES};
 use crate::violation::Severity;
 use crate::{SafetyChecker, ViolationList};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -32,6 +29,8 @@ const MAX_SAVED_DOCUMENT_BYTES: u64 = 1_000_000;
 const MAX_TRACKED_DOCUMENTS: usize = 256;
 const MAX_PUBLISHED_DIAGNOSTIC_URIS: usize = 256;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const MAX_LSP_CUSTOM_CHECK_FILES: usize = 16;
+const MAX_LSP_CUSTOM_CHECK_TOTAL_SOURCE_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentState {
@@ -188,7 +187,7 @@ impl ServerState {
         }
 
         let Some(text) = fallback_text else {
-            output.diagnostics.push(empty_event(uri, version));
+            output.diagnostics.push(self.clear_event(uri, version));
             output.messages.push(show_error_event(
                 "Saved SQL document has no readable file path or in-memory text.",
             ));
@@ -196,7 +195,7 @@ impl ServerState {
         };
 
         if saved_text_is_too_large(&text) {
-            output.diagnostics.push(empty_event(uri, version));
+            output.diagnostics.push(self.clear_event(uri, version));
             output.messages.push(log_message_event(format!(
                 "Skipping saved-text diagnostics for SQL document larger than {MAX_SAVED_DOCUMENT_BYTES} bytes."
             )));
@@ -205,7 +204,7 @@ impl ServerState {
 
         let (checker, warnings) = match self.load_checker() {
             Ok(result) => result,
-            Err(err) => return Self::config_error_output(uri, version, &err),
+            Err(err) => return self.config_error_output(uri, version, &err),
         };
         output.push_messages(warnings);
         self.run_saved_text_diagnostics(uri, &text, version, &checker, output)
@@ -224,7 +223,7 @@ impl ServerState {
                 self.run_saved_file_diagnostics(uri, path, &saved_text, version, output)
             }
             Ok(LimitedFileRead::TooLarge) => {
-                output.diagnostics.push(empty_event(uri, version));
+                output.diagnostics.push(self.clear_event(uri, version));
                 output.messages.push(log_message_event(format!(
                     "Skipping saved-file diagnostics for SQL document larger than {MAX_SAVED_DOCUMENT_BYTES} bytes."
                 )));
@@ -232,14 +231,14 @@ impl ServerState {
             }
             Err(err) => {
                 let Some(text) = fallback_text.take() else {
-                    output.diagnostics.push(empty_event(uri, version));
+                    output.diagnostics.push(self.clear_event(uri, version));
                     output.messages.push(show_error_event(format!(
                         "Failed to read saved SQL file: {err}"
                     )));
                     return output;
                 };
                 if saved_text_is_too_large(&text) {
-                    output.diagnostics.push(empty_event(uri, version));
+                    output.diagnostics.push(self.clear_event(uri, version));
                     output.messages.push(log_message_event(format!(
                         "Skipping saved-text diagnostics for SQL document larger than {MAX_SAVED_DOCUMENT_BYTES} bytes."
                     )));
@@ -247,7 +246,7 @@ impl ServerState {
                 }
                 let (checker, warnings) = match self.load_checker() {
                     Ok(result) => result,
-                    Err(err) => return Self::config_error_output(uri, version, &err),
+                    Err(err) => return self.config_error_output(uri, version, &err),
                 };
                 output.push_messages(warnings);
                 output.messages.push(log_message_event(format!(
@@ -268,7 +267,7 @@ impl ServerState {
     ) -> HandlerOutput {
         let (checker, warnings) = match self.load_checker() {
             Ok(result) => result,
-            Err(err) => return Self::config_error_output(uri, version, &err),
+            Err(err) => return self.config_error_output(uri, version, &err),
         };
         output.push_messages(warnings);
         match checker.check_file_sql_with_warnings(path, saved_text) {
@@ -287,7 +286,7 @@ impl ServerState {
                     .extend(self.parse_error_diagnostics_events(uri, saved_text, &err, version));
             }
             Err(err) => {
-                output.diagnostics.push(empty_event(uri, version));
+                output.diagnostics.push(self.clear_event(uri, version));
                 output.messages.push(show_error_event(format!(
                     "Failed to check saved SQL file: {err}"
                 )));
@@ -305,7 +304,7 @@ impl ServerState {
         mut output: HandlerOutput,
     ) -> HandlerOutput {
         if saved_text_is_too_large(text) {
-            output.diagnostics.push(empty_event(uri, version));
+            output.diagnostics.push(self.clear_event(uri, version));
             output.messages.push(log_message_event(format!(
                 "Skipping saved-text diagnostics for SQL document larger than {MAX_SAVED_DOCUMENT_BYTES} bytes."
             )));
@@ -325,7 +324,7 @@ impl ServerState {
                     .extend(self.parse_error_diagnostics_events(uri, text, &err, version));
             }
             Err(err) => {
-                output.diagnostics.push(empty_event(uri, version));
+                output.diagnostics.push(self.clear_event(uri, version));
                 output.messages.push(show_error_event(format!(
                     "Failed to check saved SQL text: {err}"
                 )));
@@ -375,7 +374,7 @@ impl ServerState {
 
         let (checker, warnings) = match self.load_checker() {
             Ok(result) => result,
-            Err(err) => return Self::config_error_output(uri, version, &err),
+            Err(err) => return self.config_error_output(uri, version, &err),
         };
 
         let mut output = HandlerOutput::default();
@@ -392,11 +391,10 @@ impl ServerState {
                     .extend(self.violations_events(uri, text, &violations, version));
             }
             Err(err) if is_parse_error(&err) => {
-                self.untrack_published_uri(&uri);
-                output.diagnostics.push(empty_event(uri, version));
+                output.diagnostics.push(self.clear_event(uri, version));
             }
             Err(err) => {
-                output.diagnostics.push(empty_event(uri, version));
+                output.diagnostics.push(self.clear_event(uri, version));
                 output.messages.push(show_error_event(format!(
                     "Failed to check SQL document: {err}"
                 )));
@@ -413,12 +411,22 @@ impl ServerState {
         }
     }
 
-    fn config_error_output(uri: Uri, version: Option<i32>, err: &ConfigError) -> HandlerOutput {
-        let mut output = HandlerOutput::with_diagnostic(empty_event(uri, version));
+    fn config_error_output(
+        &mut self,
+        uri: Uri,
+        version: Option<i32>,
+        err: &ConfigError,
+    ) -> HandlerOutput {
+        let mut output = HandlerOutput::with_diagnostic(self.clear_event(uri, version));
         output.messages.push(show_error_event(format!(
             "Failed to load diesel-guard configuration for the workspace: {err}"
         )));
         output
+    }
+
+    fn clear_event(&mut self, uri: Uri, version: Option<i32>) -> DiagnosticEvent {
+        self.untrack_published_uri(&uri);
+        empty_event(uri, version)
     }
 
     fn parse_error_diagnostics_events(
@@ -735,9 +743,9 @@ fn custom_checks_signature(
             continue;
         }
 
-        if signature.len() >= MAX_CUSTOM_CHECK_FILES {
+        if signature.len() >= MAX_LSP_CUSTOM_CHECK_FILES {
             return Err(custom_checks_too_large(format!(
-                "more than {MAX_CUSTOM_CHECK_FILES} .rhai custom check files in {custom_checks_dir}"
+                "more than {MAX_LSP_CUSTOM_CHECK_FILES} .rhai custom check files in {custom_checks_dir}"
             )));
         }
 
@@ -767,9 +775,9 @@ fn custom_check_file_signature(
             });
         };
         let next_total = total_hash_bytes.saturating_add(bytes_read);
-        if next_total > MAX_CUSTOM_CHECK_TOTAL_SOURCE_BYTES {
+        if next_total > MAX_LSP_CUSTOM_CHECK_TOTAL_SOURCE_BYTES {
             return Err(custom_checks_too_large(format!(
-                "more than {MAX_CUSTOM_CHECK_TOTAL_SOURCE_BYTES} bytes of custom check content would be hashed"
+                "more than {MAX_LSP_CUSTOM_CHECK_TOTAL_SOURCE_BYTES} bytes of custom check content would be hashed"
             )));
         }
         *total_hash_bytes = next_total;
@@ -1643,10 +1651,10 @@ mod tests {
         std::fs::write(&path, " ".repeat(oversized_len)).unwrap();
         let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
         let mut state = ServerState::new(root);
+        let uri = uri(&format!("file://{}", path.display()));
+        state.track_published_uri(&uri);
         let output = state.handle_save(DidSaveTextDocumentParams {
-            text_document: TextDocumentIdentifier {
-                uri: uri(&format!("file://{}", path.display())),
-            },
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
             text: None,
         });
 
@@ -1658,6 +1666,7 @@ mod tests {
                 .message
                 .contains("Skipping saved-file diagnostics")
         );
+        assert!(!state.published_sql_uris.contains(&uri));
     }
 
     #[test]
@@ -1667,10 +1676,10 @@ mod tests {
         let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
         let mut state = ServerState::new(root);
         let oversized_len = usize::try_from(MAX_SAVED_DOCUMENT_BYTES).unwrap() + 1;
+        let uri = uri(&format!("file://{}", path.display()));
+        state.track_published_uri(&uri);
         let output = state.handle_save(DidSaveTextDocumentParams {
-            text_document: TextDocumentIdentifier {
-                uri: uri(&format!("file://{}", path.display())),
-            },
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
             text: Some(" ".repeat(oversized_len)),
         });
 
@@ -1682,6 +1691,7 @@ mod tests {
                 .message
                 .contains("Skipping saved-text diagnostics")
         );
+        assert!(!state.published_sql_uris.contains(&uri));
     }
 
     #[test]
@@ -1971,7 +1981,7 @@ mod tests {
         let root = temp_root();
         let checks = root.path().join("checks");
         std::fs::create_dir(&checks).unwrap();
-        for index in 0..=MAX_CUSTOM_CHECK_FILES {
+        for index in 0..=MAX_LSP_CUSTOM_CHECK_FILES {
             std::fs::write(checks.join(format!("check_{index}.rhai")), "return;").unwrap();
         }
         let config = Config {
