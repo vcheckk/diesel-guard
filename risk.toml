@@ -1,0 +1,7 @@
+[[suppressions]]
+path = "src/adapters/diesel.rs"
+function = "read_metadata_toml"
+reason = "Accepted local-only score increase from rejecting symlinked Diesel metadata; covered by adapters::diesel::tests::test_extract_metadata_symlink_defaults_to_in_transaction."
+score_version = "1.0"
+expires = "2026-09-20"
+language = "rust"
