@@ -203,7 +203,9 @@ pub(super) fn custom_check_signature_from_parts(
 pub(super) fn file_content_hash(
     path: &std::path::Path,
 ) -> std::result::Result<Option<(u64, u64)>, ConfigError> {
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(file) =
+        crate::file_read::open_regular_file!(path, "custom check path is not a regular file")
+    else {
         return Ok(None);
     };
     let mut reader = file.take(MAX_CUSTOM_CHECK_SOURCE_BYTES.saturating_add(1));
@@ -231,24 +233,13 @@ pub(super) fn read_file_to_string_with_limit(
     path: &Utf8Path,
     limit: u64,
 ) -> std::io::Result<LimitedFileRead> {
-    ensure_regular_file(path)?;
     let bytes = read_file_bytes_with_limit(path, limit)?;
     limited_bytes_to_string(bytes, limit)
 }
 
-pub(super) fn ensure_regular_file(path: &Utf8Path) -> std::io::Result<()> {
-    let file_type = std::fs::symlink_metadata(path)?.file_type();
-    if !file_type.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "path is not a regular file",
-        ));
-    }
-    Ok(())
-}
-
 pub(super) fn read_file_bytes_with_limit(path: &Utf8Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
+    let file =
+        crate::file_read::open_regular_file!(path.as_std_path(), "path is not a regular file")?;
     let mut reader = file.take(limit.saturating_add(1));
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;

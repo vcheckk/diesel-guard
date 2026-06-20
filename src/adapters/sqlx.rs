@@ -82,15 +82,10 @@ impl MigrationAdapter for SqlxAdapter {
 }
 
 fn read_sqlx_metadata_prefix(file_path: &Utf8Path) -> std::io::Result<String> {
-    let file_type = std::fs::symlink_metadata(file_path)?.file_type();
-    if !file_type.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "SQLx metadata path is not a regular file",
-        ));
-    }
-
-    let file = std::fs::File::open(file_path)?;
+    let file = crate::file_read::open_regular_file!(
+        file_path.as_std_path(),
+        "SQLx metadata path is not a regular file",
+    )?;
     let mut reader = file.take(MAX_SQLX_METADATA_SCAN_BYTES);
     let mut content = String::new();
     reader.read_to_string(&mut content)?;

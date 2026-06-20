@@ -247,15 +247,10 @@ fn read_regular_file_to_string_with_limit(
     path: &Utf8Path,
     max_bytes: u64,
 ) -> Result<String, ConfigError> {
-    let file_type = std::fs::symlink_metadata(path)?.file_type();
-    if !file_type.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "config path is not a regular file",
-        )
-        .into());
-    }
-    let file = std::fs::File::open(path)?;
+    let file = crate::file_read::open_regular_file!(
+        path.as_std_path(),
+        "config path is not a regular file",
+    )?;
     let mut reader = file.take(max_bytes.saturating_add(1));
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;

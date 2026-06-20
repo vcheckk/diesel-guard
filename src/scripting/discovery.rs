@@ -170,7 +170,8 @@ pub(super) fn push_custom_check_file(
 }
 
 pub(super) fn read_script_source(path: &std::path::Path) -> std::io::Result<ScriptSource> {
-    let file = std::fs::File::open(path)?;
+    let file =
+        crate::file_read::open_regular_file!(path, "custom check path is not a regular file")?;
     let mut reader = file.take(MAX_CUSTOM_CHECK_SOURCE_BYTES.saturating_add(1));
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;

@@ -132,11 +132,11 @@ impl MigrationAdapter for DieselAdapter {
 }
 
 fn read_metadata_toml(metadata_path: &Utf8Path) -> Option<String> {
-    let file = std::fs::symlink_metadata(metadata_path)
-        .ok()?
-        .file_type()
-        .is_file()
-        .then(|| std::fs::File::open(metadata_path).ok())??;
+    let file = crate::file_read::open_regular_file!(
+        metadata_path.as_std_path(),
+        "Diesel metadata path is not a regular file",
+    )
+    .ok()?;
     let mut reader = file.take(MAX_METADATA_BYTES.saturating_add(1));
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).ok()?;
