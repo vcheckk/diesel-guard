@@ -91,7 +91,10 @@ impl Check for CustomCheck {
             Err(e) => return self.internal_error(&e),
         };
 
-        let dynamic_ctx = rhai::serde::to_dynamic(ctx).unwrap();
+        let dynamic_ctx = match rhai::serde::to_dynamic(ctx) {
+            Ok(d) => d,
+            Err(e) => return self.internal_error(&e),
+        };
 
         let mut scope = rhai::Scope::new();
         scope.push("node", dynamic_node);
