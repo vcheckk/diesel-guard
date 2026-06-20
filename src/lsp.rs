@@ -79,6 +79,7 @@ pub struct ServerState {
     checker_cache: Option<CheckerCache>,
     last_config_error_message: Option<String>,
     warned_incremental_change: bool,
+    warned_unsupported_notification: bool,
     shutdown_requested: bool,
 }
 
@@ -117,6 +118,7 @@ impl ServerState {
             checker_cache: None,
             last_config_error_message: None,
             warned_incremental_change: false,
+            warned_unsupported_notification: false,
             shutdown_requested: false,
         }
     }
@@ -615,9 +617,12 @@ impl ServerState {
             }
             other => {
                 let mut output = HandlerOutput::default();
-                output.messages.push(log_message_event(format!(
-                    "Ignoring unsupported notification: {other}"
-                )));
+                if !self.warned_unsupported_notification {
+                    self.warned_unsupported_notification = true;
+                    output.messages.push(log_message_event(format!(
+                        "Ignoring unsupported notification: {other}"
+                    )));
+                }
                 output
             }
         }
@@ -1896,6 +1901,30 @@ mod tests {
             response.error.unwrap().code,
             ErrorCode::MethodNotFound as i32
         );
+    }
+
+    #[test]
+    fn repeated_unsupported_notifications_do_not_repeat_log() {
+        let root = temp_root();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+
+        let first = state.handle_notification(Notification::new(
+            "workspace/didChangeConfiguration".to_string(),
+            json!({}),
+        ));
+        assert_eq!(first.messages.len(), 1);
+        assert!(
+            first.messages[0]
+                .message
+                .contains("Ignoring unsupported notification")
+        );
+
+        let second = state.handle_notification(Notification::new(
+            "workspace/didChangeConfiguration".to_string(),
+            json!({}),
+        ));
+        assert!(second.messages.is_empty());
     }
 
     #[test]
