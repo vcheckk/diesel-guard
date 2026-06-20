@@ -74,7 +74,7 @@ Considerations:
 - Requires Postgres 11+ for PRIMARY KEY USING INDEX
 - Cannot run CONCURRENTLY inside a transaction block
   For Diesel migrations: Create metadata.toml with run_in_transaction = false
-  For SQLx migrations: Add -- no-transaction directive at the top of the file
+  For SQLx migrations: Add -- no-transaction directive to the migration file
 - Takes longer than non-concurrent creation
 - May fail if duplicate or NULL values exist (leaves behind invalid index that should be dropped)
 

@@ -2,6 +2,7 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use diesel_guard::ast_dump;
 use diesel_guard::formatters::{Formatter, GithubFormatter, JsonFormatter, TextFormatter};
+use diesel_guard::safety_checker::read_sql_file_to_string;
 use diesel_guard::violation::Severity;
 use diesel_guard::{Config, SafetyChecker};
 use miette::{IntoDiagnostic, Result};
@@ -202,7 +203,7 @@ fn run_explain(check_name: &str, format: Format) -> Result<()> {
         .find(|c| c.name() == check_name)
     else {
         eprintln!("Error: No check named '{check_name}'.");
-        eprintln!("Run --list-checks to see available checks.");
+        eprintln!("Run `diesel-guard list-checks` to see available checks.");
         exit(1);
     };
     print!("{}", format.formatter().format_explain(check, &config));
@@ -233,8 +234,7 @@ fn main() -> Result<()> {
         Commands::DumpAst { sql, file } => {
             let sql_input = match (sql, file) {
                 (Some(s), _) => s,
-                (None, Some(path)) => fs::read_to_string(&path)
-                    .into_diagnostic()
+                (None, Some(path)) => read_sql_file_to_string(&path)
                     .map_err(|e| miette::miette!("Failed to read file '{}': {}", path, e))?,
                 (None, None) => {
                     eprintln!("Error: provide either --sql or --file");

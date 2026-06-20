@@ -7,7 +7,40 @@ use crate::parser;
 use crate::scripting;
 use camino::Utf8Path;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
+
+pub const MAX_SQL_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+
+pub fn read_sql_file_to_string(path: &Utf8Path) -> Result<String> {
+    let file_type = fs::symlink_metadata(path)?.file_type();
+    if !file_type.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SQL input path is not a regular file",
+        )
+        .into());
+    }
+
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    read_sql_reader_to_string(&mut reader, path.as_str())
+}
+
+fn read_sql_reader_to_string(reader: &mut dyn Read, source: &str) -> Result<String> {
+    let mut limited_reader = reader.take(MAX_SQL_INPUT_BYTES.saturating_add(1));
+    let mut buffer = Vec::new();
+    limited_reader.read_to_end(&mut buffer)?;
+
+    if u64::try_from(buffer.len()).unwrap_or(u64::MAX) > MAX_SQL_INPUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SQL input '{source}' is larger than {MAX_SQL_INPUT_BYTES} bytes"),
+        )
+        .into());
+    }
+
+    String::from_utf8(buffer).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err).into())
+}
 
 pub struct SafetyChecker {
     registry: Registry,
@@ -78,7 +111,7 @@ impl SafetyChecker {
                 .filter(|name| !known_check_names.iter().any(|known| known == *name))
                 .map(|name| {
                     format!(
-                        "Unknown check name '{name}' in {field}. Run --list-checks to see available checks."
+                        "Unknown check name '{name}' in {field}. Run `diesel-guard list-checks` to see available checks."
                     )
                 })
                 .collect::<Vec<_>>()
@@ -136,7 +169,7 @@ impl SafetyChecker {
                 .any(|known| known.as_str() == name)
             {
                 warnings.push(format!(
-                    "Unknown check name '{name}' in {source}. Run --list-checks to see available checks."
+                    "Unknown check name '{name}' in {source}. Run `diesel-guard list-checks` to see available checks."
                 ));
             }
         }
@@ -165,7 +198,7 @@ impl SafetyChecker {
         &self,
         path: &Utf8Path,
     ) -> Result<(ViolationList, Vec<String>)> {
-        let sql = fs::read_to_string(path)?;
+        let sql = read_sql_file_to_string(path)?;
         self.check_file_sql_with_warnings(path, &sql)
     }
 
@@ -236,12 +269,9 @@ impl SafetyChecker {
 
     /// Check a single migration file
     pub fn check_file(&self, path: &Utf8Path) -> Result<ViolationList> {
-        let sql = fs::read_to_string(path)?;
+        let sql = read_sql_file_to_string(path)?;
 
-        let ctx = self
-            .adapter()
-            .map(|a| a.extract_migration_metadata(path))
-            .unwrap_or_default();
+        let ctx = self.migration_metadata_for_sql_snapshot(path, &sql);
 
         match parser::parse_with_metadata(&sql) {
             Ok(parsed) => {
@@ -277,9 +307,9 @@ impl SafetyChecker {
         let mut results = Vec::new();
 
         for mig_file in migration_files {
-            let sql = fs::read_to_string(&mig_file.path)?;
+            let sql = read_sql_file_to_string(&mig_file.path)?;
 
-            let ctx = adapter.extract_migration_metadata(&mig_file.path);
+            let ctx = self.migration_metadata_for_sql_snapshot(&mig_file.path, &sql);
 
             match parser::parse_with_metadata(&sql) {
                 Ok(parsed) => {
@@ -310,8 +340,7 @@ impl SafetyChecker {
 
     // check a migration string from a buffer
     fn check_buffer(&self, reader: &mut dyn BufRead) -> Result<ViolationList> {
-        let mut buffer = String::new();
-        reader.read_to_string(&mut buffer)?;
+        let buffer = read_sql_reader_to_string(reader, "stdin")?;
         self.check_sql(&buffer)
     }
 
@@ -826,6 +855,77 @@ mod tests {
     }
 
     #[test]
+    fn test_check_file_rejects_oversized_sql_input() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("huge.sql");
+        std::fs::write(
+            &file,
+            " ".repeat(usize::try_from(MAX_SQL_INPUT_BYTES).unwrap() + 1),
+        )
+        .unwrap();
+
+        let checker = SafetyChecker::with_config(Config::default());
+        let path = Utf8Path::from_path(&file).unwrap();
+        let err = checker.check_file(path).unwrap_err();
+
+        match err {
+            crate::error::DieselGuardError::IoError(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    err.to_string().contains("is larger than 16777216 bytes"),
+                    "expected oversized SQL input error, got: {err}"
+                );
+            }
+            other => panic!("expected oversized SQL input io error, got: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_rejects_sql_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.sql");
+        let link = dir.path().join("link.sql");
+        std::fs::write(&target, "SELECT 1;").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let checker = SafetyChecker::with_config(Config::default());
+        let path = Utf8Path::from_path(&link).unwrap();
+        let err = checker.check_file(path).unwrap_err();
+
+        match err {
+            crate::error::DieselGuardError::IoError(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(err.to_string(), "SQL input path is not a regular file");
+            }
+            other => panic!("expected symlink rejection io error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_buffer_rejects_oversized_sql_input() {
+        let checker = SafetyChecker::with_config(Config::default());
+        let oversized = " ".repeat(usize::try_from(MAX_SQL_INPUT_BYTES).unwrap() + 1);
+        let mut reader = BufReader::new(Cursor::new(oversized));
+
+        let err = checker.check_buffer(&mut reader).unwrap_err();
+
+        match err {
+            crate::error::DieselGuardError::IoError(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    err.to_string()
+                        .contains("SQL input 'stdin' is larger than 16777216 bytes"),
+                    "expected oversized stdin SQL input error, got: {err}"
+                );
+            }
+            other => panic!("expected oversized stdin SQL input io error, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_check_sql_warns_on_duplicate_migration_disabled_checks() {
         let checker = SafetyChecker::with_config(Config::default());
         // Duplicate name in disable directive — warn_unknown_migration_disabled_checks deduplicates.
@@ -841,5 +941,25 @@ mod tests {
         let sql =
             "-- diesel-guard:disable FakeCheckThatDoesNotExist\nALTER TABLE t ADD COLUMN x TEXT;";
         let _ = checker.check_sql(sql).unwrap();
+    }
+
+    #[test]
+    fn test_unknown_check_warning_points_to_list_checks_subcommand() {
+        let (_, warnings) = SafetyChecker::with_config_and_warnings(Config {
+            disable_checks: vec!["FakeCheckThatDoesNotExist".to_string()],
+            ..Config::default()
+        });
+
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("Run `diesel-guard list-checks` to see available checks."),
+            "expected list-checks subcommand guidance, got: {}",
+            warnings[0]
+        );
+        assert!(
+            !warnings[0].contains("--list-checks"),
+            "guidance must not refer to a non-existent --list-checks flag: {}",
+            warnings[0]
+        );
     }
 }

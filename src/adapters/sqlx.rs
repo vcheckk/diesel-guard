@@ -11,6 +11,7 @@ use super::{
 };
 use camino::Utf8Path;
 use regex::Regex;
+use std::io::Read;
 use std::sync::LazyLock;
 
 /// Regex pattern for SQLx version format (one or more digits).
@@ -20,8 +21,8 @@ use std::sync::LazyLock;
 static SQLX_VERSION_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+)(_|\.)?").expect("valid regex pattern"));
 
-const NO_TRANSACTION_HINT: &str =
-    "Add `-- no-transaction` as the first line of the migration file.";
+const NO_TRANSACTION_HINT: &str = "Add `-- no-transaction` to the migration file.";
+const MAX_SQLX_METADATA_SCAN_BYTES: u64 = 16 * 1024 * 1024;
 
 /// SQLx migration adapter.
 pub struct SqlxAdapter;
@@ -68,7 +69,7 @@ impl MigrationAdapter for SqlxAdapter {
     }
 
     fn extract_migration_metadata(&self, file_path: &Utf8Path) -> MigrationContext {
-        let Ok(content) = std::fs::read_to_string(file_path) else {
+        let Ok(content) = read_sqlx_metadata_prefix(file_path) else {
             return MigrationContext {
                 run_in_transaction: true,
                 no_transaction_hint: NO_TRANSACTION_HINT,
@@ -78,6 +79,22 @@ impl MigrationAdapter for SqlxAdapter {
 
         Self::extract_migration_metadata_from_sql(&content)
     }
+}
+
+fn read_sqlx_metadata_prefix(file_path: &Utf8Path) -> std::io::Result<String> {
+    let file_type = std::fs::symlink_metadata(file_path)?.file_type();
+    if !file_type.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "SQLx metadata path is not a regular file",
+        ));
+    }
+
+    let file = std::fs::File::open(file_path)?;
+    let mut reader = file.take(MAX_SQLX_METADATA_SCAN_BYTES);
+    let mut content = String::new();
+    reader.read_to_string(&mut content)?;
+    Ok(content)
 }
 
 impl SqlxAdapter {
@@ -281,6 +298,37 @@ mod tests {
         let path = Utf8Path::from_path(&sql_file).unwrap();
         let meta = adapter.extract_migration_metadata(path);
         assert!(!meta.run_in_transaction);
+    }
+
+    #[test]
+    fn test_extract_metadata_caps_scan_but_detects_early_directive() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let sql_file = temp_dir.path().join("20240101000000_add_index.sql");
+        let mut sql = "-- no-transaction\n".to_string();
+        sql.push_str(&" ".repeat(usize::try_from(MAX_SQLX_METADATA_SCAN_BYTES).unwrap() + 1));
+        fs::write(&sql_file, sql).unwrap();
+
+        let adapter = SqlxAdapter;
+        let path = Utf8Path::from_path(&sql_file).unwrap();
+        let meta = adapter.extract_migration_metadata(path);
+        assert!(!meta.run_in_transaction);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_metadata_symlink_defaults_to_in_transaction() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let target = temp_dir.path().join("target.sql");
+        let link = temp_dir.path().join("20240101000000_add_index.sql");
+        fs::write(&target, "-- no-transaction\nSELECT 1;\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let adapter = SqlxAdapter;
+        let path = Utf8Path::from_path(&link).unwrap();
+        let meta = adapter.extract_migration_metadata(path);
+        assert!(meta.run_in_transaction);
     }
 
     #[test]

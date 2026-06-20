@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use thiserror::Error;
 
+pub const DEFAULT_CONFIG_MAX_BYTES: u64 = 64 * 1024;
+
 /// Generate help text for invalid check names from the registry
 fn valid_check_names_help() -> String {
     format!(
@@ -157,7 +159,7 @@ impl Config {
 
     /// Load config from specific path (useful for testing)
     pub fn load_from_path(path: &Utf8Path) -> Result<Self, ConfigError> {
-        let contents = std::fs::read_to_string(path)?;
+        let contents = read_regular_file_to_string_with_limit(path, DEFAULT_CONFIG_MAX_BYTES)?;
         Self::load_from_str(&contents)
     }
 
@@ -364,6 +366,21 @@ disable_checks = ["AddColumnCheck"]
         assert_eq!(config.start_after, Some("2024_01_01_000000".to_string()));
         assert!(config.check_down);
         assert_eq!(config.disable_checks, vec!["AddColumnCheck".to_string()]);
+    }
+
+    #[test]
+    fn test_load_from_path_rejects_oversized_config() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let config_path = temp_dir.path().join("diesel-guard.toml");
+        fs::write(
+            &config_path,
+            "x".repeat(usize::try_from(DEFAULT_CONFIG_MAX_BYTES).unwrap() + 1),
+        )
+        .unwrap();
+
+        let config_path_utf8 = Utf8Path::from_path(&config_path).unwrap();
+        let err = Config::load_from_path(config_path_utf8).unwrap_err();
+        assert!(matches!(err, ConfigError::ConfigTooLarge { .. }));
     }
 
     #[test]

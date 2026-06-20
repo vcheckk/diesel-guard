@@ -242,6 +242,15 @@ fn test_explain_unknown_check_exits_one() {
         !output.status.success(),
         "explain for unknown check must exit 1"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Run `diesel-guard list-checks` to see available checks."),
+        "expected list-checks subcommand guidance, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("--list-checks"),
+        "guidance must not refer to a non-existent --list-checks flag: {stderr}"
+    );
 }
 
 // --- explain (json) ---

@@ -31,7 +31,7 @@ CREATE UNIQUE INDEX CONCURRENTLY idx_users_username ON users(username);
 run_in_transaction = false
 ```
 
-**For SQLx migrations:** Add the no-transaction directive at the top of your migration file:
+**For SQLx migrations:** Add the no-transaction directive to your migration file:
 
 ```sql
 -- no-transaction

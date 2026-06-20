@@ -203,7 +203,7 @@ mod tests {
             &Config::default(),
             &MigrationContext {
                 run_in_transaction: true,
-                no_transaction_hint: "Add `-- no-transaction` as the first line of the migration file.",
+                no_transaction_hint: "Add `-- no-transaction` to the migration file.",
                 ..MigrationContext::default()
             },
         );
