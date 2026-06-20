@@ -6,22 +6,15 @@ use crate::error::Result;
 use crate::parser;
 use crate::scripting;
 use camino::Utf8Path;
-use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 
 pub const MAX_SQL_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 
 pub fn read_sql_file_to_string(path: &Utf8Path) -> Result<String> {
-    let file_type = fs::symlink_metadata(path)?.file_type();
-    if !file_type.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "SQL input path is not a regular file",
-        )
-        .into());
-    }
-
-    let file = fs::File::open(path)?;
+    let file = crate::file_read::open_regular_file!(
+        path.as_std_path(),
+        "SQL input path is not a regular file",
+    )?;
     let mut reader = BufReader::new(file);
     read_sql_reader_to_string(&mut reader, path.as_str())
 }
