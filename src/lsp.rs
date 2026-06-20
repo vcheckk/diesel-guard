@@ -77,6 +77,7 @@ pub struct ServerState {
     published_sql_uris: HashSet<Uri>,
     published_sql_uri_order: VecDeque<Uri>,
     checker_cache: Option<CheckerCache>,
+    last_config_error_message: Option<String>,
     shutdown_requested: bool,
 }
 
@@ -113,6 +114,7 @@ impl ServerState {
             published_sql_uris: HashSet::new(),
             published_sql_uri_order: VecDeque::new(),
             checker_cache: None,
+            last_config_error_message: None,
             shutdown_requested: false,
         }
     }
@@ -417,9 +419,11 @@ impl ServerState {
         err: &ConfigError,
     ) -> HandlerOutput {
         let mut output = HandlerOutput::with_diagnostic(self.clear_event(uri, version));
-        output.messages.push(show_error_event(format!(
-            "Failed to load diesel-guard configuration for the workspace: {err}"
-        )));
+        let message = format!("Failed to load diesel-guard configuration for the workspace: {err}");
+        if self.last_config_error_message.as_deref() != Some(message.as_str()) {
+            self.last_config_error_message = Some(message.clone());
+            output.messages.push(show_error_event(message));
+        }
         output
     }
 
@@ -506,6 +510,7 @@ impl ServerState {
         };
 
         if let Some(cache) = self.checker_cache.as_ref().filter(|cache| cache.key == key) {
+            self.last_config_error_message = None;
             return Ok((Arc::clone(&cache.checker), Vec::new()));
         }
 
@@ -516,6 +521,7 @@ impl ServerState {
             key,
             checker: Arc::clone(&checker),
         });
+        self.last_config_error_message = None;
         Ok((checker, warnings))
     }
 
@@ -1325,6 +1331,40 @@ mod tests {
                 .message
                 .contains("Missing required field")
         );
+    }
+
+    #[test]
+    fn repeated_config_error_clears_without_repeating_message() {
+        let root = temp_root();
+        std::fs::write(root.path().join("diesel-guard.toml"), "check_down = true\n").unwrap();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+        let uri = uri("file:///tmp/repeated-config-error.sql");
+
+        let output = state.handle_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "sql".to_string(),
+                version: 1,
+                text: "SELECT 1;".to_string(),
+            },
+        });
+        assert_eq!(output.diagnostics.len(), 1);
+        assert!(output.diagnostics[0].diagnostics.is_empty());
+        assert_eq!(output.messages.len(), 1);
+
+        let output = state.handle_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier { uri, version: 2 },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "SELECT 2;".to_string(),
+            }],
+        });
+
+        assert_eq!(output.diagnostics.len(), 1);
+        assert!(output.diagnostics[0].diagnostics.is_empty());
+        assert!(output.messages.is_empty());
     }
 
     #[test]
