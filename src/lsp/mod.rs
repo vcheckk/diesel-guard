@@ -1,8 +1,10 @@
+use crate::SafetyChecker;
+#[cfg(test)]
 use crate::config::{Config, ConfigError};
-use crate::error::{DieselGuardError, Result};
-use crate::{SafetyChecker, ViolationList};
 use camino::{Utf8Path, Utf8PathBuf};
-use lsp_server::{Connection, ErrorCode, Message, Notification, Response};
+#[cfg(test)]
+use lsp_server::{Connection, Message, Notification, Response};
+#[cfg(test)]
 use lsp_types::notification::Notification as LspNotification;
 use lsp_types::{
     Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
@@ -10,34 +12,35 @@ use lsp_types::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::SystemTime;
 
+mod checker;
 mod config_cache;
+mod diagnostic_output;
 mod diagnostics;
 mod protocol;
 mod session;
+mod transport;
 mod uri;
 
+use checker::{CheckerCache, CheckerCacheKey, CustomCheckFileSignature};
 pub use config_cache::load_lsp_config;
-use config_cache::{
-    checker_cache_key_with_lsp_fallback, live_document_state, live_text_is_too_large,
-    read_file_to_string_with_limit, saved_text_is_too_large,
-};
 #[cfg(test)]
 use config_cache::{custom_checks_signature, file_content_hash};
+use config_cache::{
+    live_document_state, live_text_is_too_large, read_file_to_string_with_limit,
+    saved_text_is_too_large,
+};
+use diagnostic_output::{CheckDiagnosticContext, ParseErrorOutput};
 #[cfg(test)]
 use diagnostics::byte_offset_to_position;
 pub use diagnostics::violations_to_diagnostics;
-use diagnostics::{
-    check_live_sql, empty_event, final_full_sync_text, is_parse_error, parse_error_event,
-};
+use diagnostics::{check_live_sql, empty_event, final_full_sync_text};
 pub use protocol::unsupported_request_response;
-use protocol::{
-    deserialize_error_output, log_message_event, protocol_error, publish_diagnostics,
-    publish_log_messages, send_response, show_error_event,
-};
-use session::{document_notification_kind, is_initialized_notification};
+use protocol::{log_message_event, show_error_event};
+#[cfg(test)]
+use session::document_notification_kind;
 pub use session::{initialize_result, run, select_workspace_root};
+use transport::DocumentNotificationKind;
 #[cfg(test)]
 use uri::percent_decode_utf8;
 pub use uri::{file_uri_to_path, is_sql_file_uri};
@@ -103,75 +106,10 @@ pub struct ServerState {
     shutdown_requested: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoopControl {
-    Continue,
-    Exit(i32),
-}
-
-struct CheckerCache {
-    key: CheckerCacheKey,
-    checker: Arc<SafetyChecker>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CheckerCacheKey {
-    config: String,
-    custom_checks_signature: Vec<CustomCheckFileSignature>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CustomCheckFileSignature {
-    path: String,
-    modified: Option<SystemTime>,
-    len: Option<u64>,
-    content_hash: Option<u64>,
-}
-
 #[derive(Debug)]
 enum LimitedFileRead {
     Text(String),
     TooLarge,
-}
-
-#[derive(Clone, Copy)]
-enum ParseErrorOutput {
-    PublishDiagnostic,
-    ClearOnly,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DocumentNotificationKind {
-    Open,
-    Change,
-    Save,
-    Close,
-}
-
-impl DocumentNotificationKind {
-    fn handle(self, state: &mut ServerState, params: serde_json::Value) -> HandlerOutput {
-        match self {
-            Self::Open => {
-                state.handle_typed_notification("didOpen", params, ServerState::handle_open)
-            }
-            Self::Change => {
-                state.handle_typed_notification("didChange", params, ServerState::handle_change)
-            }
-            Self::Save => {
-                state.handle_typed_notification("didSave", params, ServerState::handle_save)
-            }
-            Self::Close => {
-                state.handle_typed_notification("didClose", params, ServerState::handle_close)
-            }
-        }
-    }
-}
-
-struct CheckDiagnosticContext<'a> {
-    uri: Uri,
-    version: Option<i32>,
-    parse_error_output: ParseErrorOutput,
-    error_context: &'a str,
 }
 
 impl ServerState {
@@ -535,334 +473,6 @@ impl ServerState {
         output.messages.push(log_message_event(format!(
             "Skipping live diagnostics for SQL document larger than {MAX_LIVE_DOCUMENT_BYTES} bytes; very large live and saved SQL documents are skipped to keep the editor responsive."
         )));
-        output
-    }
-
-    fn apply_check_result(
-        &mut self,
-        context: CheckDiagnosticContext<'_>,
-        text: &str,
-        mut output: HandlerOutput,
-        check_result: Result<(ViolationList, Vec<String>)>,
-    ) -> HandlerOutput {
-        match check_result {
-            Ok((violations, check_warnings)) => {
-                self.append_successful_diagnostics(
-                    context.uri,
-                    text,
-                    context.version,
-                    &mut output,
-                    &violations,
-                    check_warnings,
-                );
-            }
-            Err(err) if is_parse_error(&err) => self.append_parse_error_diagnostics(
-                context.uri,
-                text,
-                context.version,
-                &mut output,
-                &err,
-                context.parse_error_output,
-            ),
-            Err(err) => self.append_check_error(
-                context.uri,
-                context.version,
-                &mut output,
-                context.error_context,
-                &err,
-            ),
-        }
-        output
-    }
-
-    fn append_successful_diagnostics(
-        &mut self,
-        uri: Uri,
-        text: &str,
-        version: Option<i32>,
-        output: &mut HandlerOutput,
-        violations: &ViolationList,
-        check_warnings: Vec<String>,
-    ) {
-        output.push_messages(check_warnings);
-        output
-            .diagnostics
-            .extend(self.violations_events(uri, text, violations, version));
-    }
-
-    fn append_parse_error_diagnostics(
-        &mut self,
-        uri: Uri,
-        text: &str,
-        version: Option<i32>,
-        output: &mut HandlerOutput,
-        err: &DieselGuardError,
-        parse_error_output: ParseErrorOutput,
-    ) {
-        match parse_error_output {
-            ParseErrorOutput::PublishDiagnostic => output
-                .diagnostics
-                .extend(self.parse_error_diagnostics_events(uri, text, err, version)),
-            ParseErrorOutput::ClearOnly => output.diagnostics.push(self.clear_event(uri, version)),
-        }
-    }
-
-    fn append_check_error(
-        &mut self,
-        uri: Uri,
-        version: Option<i32>,
-        output: &mut HandlerOutput,
-        context: &str,
-        err: &DieselGuardError,
-    ) {
-        output.diagnostics.push(self.clear_event(uri, version));
-        output
-            .messages
-            .push(show_error_event(format!("{context}: {err}")));
-    }
-
-    fn clear_if_needed(&mut self, uri: Uri, version: Option<i32>) -> HandlerOutput {
-        if self.untrack_published_uri(&uri) {
-            HandlerOutput::with_diagnostic(empty_event(uri, version))
-        } else {
-            HandlerOutput::default()
-        }
-    }
-
-    fn config_error_output(
-        &mut self,
-        uri: Uri,
-        version: Option<i32>,
-        err: &ConfigError,
-    ) -> HandlerOutput {
-        let mut output = HandlerOutput::with_diagnostic(self.clear_event(uri, version));
-        let message = format!("Failed to load diesel-guard configuration for the workspace: {err}");
-        if self.last_config_error_message.as_deref() != Some(message.as_str()) {
-            self.last_config_error_message = Some(message.clone());
-            output.messages.push(show_error_event(message));
-        }
-        output
-    }
-
-    fn clear_event(&mut self, uri: Uri, version: Option<i32>) -> DiagnosticEvent {
-        self.untrack_published_uri(&uri);
-        empty_event(uri, version)
-    }
-
-    fn parse_error_diagnostics_events(
-        &mut self,
-        uri: Uri,
-        text: &str,
-        err: &DieselGuardError,
-        version: Option<i32>,
-    ) -> Vec<DiagnosticEvent> {
-        let mut events = self.track_published_uri(&uri);
-        events.push(parse_error_event(uri, text, err, version));
-        events
-    }
-
-    fn violations_events(
-        &mut self,
-        uri: Uri,
-        text: &str,
-        violations: &ViolationList,
-        version: Option<i32>,
-    ) -> Vec<DiagnosticEvent> {
-        let diagnostics = violations_to_diagnostics(text, violations);
-        let mut events = if diagnostics.is_empty() {
-            self.untrack_published_uri(&uri);
-            Vec::new()
-        } else {
-            self.track_published_uri(&uri)
-        };
-        events.push(DiagnosticEvent {
-            uri,
-            diagnostics,
-            version,
-        });
-        events
-    }
-
-    fn track_published_uri(&mut self, uri: &Uri) -> Vec<DiagnosticEvent> {
-        if self.published_sql_uris.insert(uri.clone()) {
-            self.published_sql_uri_order.push_back(uri.clone());
-        }
-
-        let mut events = Vec::new();
-        while self.published_sql_uris.len() > MAX_PUBLISHED_DIAGNOSTIC_URIS {
-            let Some(evicted_uri) = self.published_sql_uri_order.pop_front() else {
-                break;
-            };
-            if self.published_sql_uris.remove(&evicted_uri) {
-                events.push(empty_event(evicted_uri, None));
-            }
-        }
-        events
-    }
-
-    fn untrack_published_uri(&mut self, uri: &Uri) -> bool {
-        let removed = self.published_sql_uris.remove(uri);
-        if removed {
-            self.published_sql_uri_order
-                .retain(|tracked_uri| tracked_uri != uri);
-        }
-        removed
-    }
-
-    fn load_checker(
-        &mut self,
-    ) -> std::result::Result<(Arc<SafetyChecker>, Vec<String>), ConfigError> {
-        let (config, key, cache_warnings) = self.load_checker_inputs()?;
-
-        if let Some(checker) = self.cached_checker(&key) {
-            return Ok((checker, Vec::new()));
-        }
-
-        Ok(self.build_cached_checker(config, key, cache_warnings))
-    }
-
-    fn load_checker_inputs(
-        &self,
-    ) -> std::result::Result<(Config, CheckerCacheKey, Vec<String>), ConfigError> {
-        let mut config = load_lsp_config(&self.root)?;
-        let mut cache_warnings = Vec::new();
-        let key = checker_cache_key_with_lsp_fallback(&mut config, &mut cache_warnings)?;
-        Ok((config, key, cache_warnings))
-    }
-
-    fn cached_checker(&mut self, key: &CheckerCacheKey) -> Option<Arc<SafetyChecker>> {
-        let checker = self
-            .checker_cache
-            .as_ref()
-            .filter(|cache| cache.key == *key)
-            .map(|cache| Arc::clone(&cache.checker))?;
-        self.last_config_error_message = None;
-        Some(checker)
-    }
-
-    fn build_cached_checker(
-        &mut self,
-        config: Config,
-        key: CheckerCacheKey,
-        cache_warnings: Vec<String>,
-    ) -> (Arc<SafetyChecker>, Vec<String>) {
-        let (checker, mut warnings) = SafetyChecker::with_config_and_warnings(config);
-        warnings.splice(0..0, cache_warnings);
-        let checker = Arc::new(checker);
-        self.checker_cache = Some(CheckerCache {
-            key,
-            checker: Arc::clone(&checker),
-        });
-        self.last_config_error_message = None;
-        (checker, warnings)
-    }
-
-    fn apply_output(connection: &Connection, output: HandlerOutput) -> Result<()> {
-        publish_diagnostics(connection, output.diagnostics)?;
-        publish_log_messages(connection, output.messages)?;
-        Ok(())
-    }
-
-    fn run_loop(&mut self, connection: &Connection) -> Result<i32> {
-        for message in &connection.receiver {
-            match self.handle_message(connection, message)? {
-                LoopControl::Continue => {}
-                LoopControl::Exit(code) => return Ok(code),
-            }
-        }
-
-        Ok(0)
-    }
-
-    fn handle_message(&mut self, connection: &Connection, message: Message) -> Result<LoopControl> {
-        match message {
-            Message::Request(request) => self.handle_request_message(connection, request),
-            Message::Notification(notification) => {
-                self.handle_notification_message(connection, notification)
-            }
-            Message::Response(_) => Ok(LoopControl::Continue),
-        }
-    }
-
-    fn handle_request_message(
-        &mut self,
-        connection: &Connection,
-        request: lsp_server::Request,
-    ) -> Result<LoopControl> {
-        if connection
-            .handle_shutdown(&request)
-            .map_err(protocol_error)?
-        {
-            self.shutdown_requested = true;
-            return Ok(LoopControl::Continue);
-        }
-
-        send_response(
-            connection,
-            Response::new_err(
-                request.id,
-                ErrorCode::MethodNotFound as i32,
-                format!("Unsupported request method: {}", request.method),
-            ),
-        )?;
-        Ok(LoopControl::Continue)
-    }
-
-    fn handle_notification_message(
-        &mut self,
-        connection: &Connection,
-        notification: Notification,
-    ) -> Result<LoopControl> {
-        if notification.method == lsp_types::notification::Exit::METHOD {
-            return Ok(LoopControl::Exit(i32::from(!self.shutdown_requested)));
-        }
-
-        let output = self.handle_notification(notification);
-        Self::apply_output(connection, output)?;
-        Ok(LoopControl::Continue)
-    }
-
-    fn handle_notification(&mut self, notification: Notification) -> HandlerOutput {
-        let method = notification.method.as_str();
-        if is_initialized_notification(method) {
-            return HandlerOutput::default();
-        }
-        self.handle_document_notification(method, notification.params)
-            .unwrap_or_else(|| self.unsupported_notification_output(method))
-    }
-
-    fn handle_document_notification(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Option<HandlerOutput> {
-        let kind = document_notification_kind(method)?;
-        Some(kind.handle(self, params))
-    }
-
-    fn handle_typed_notification<T>(
-        &mut self,
-        method_label: &str,
-        params: serde_json::Value,
-        handler: fn(&mut Self, T) -> HandlerOutput,
-    ) -> HandlerOutput
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        match serde_json::from_value(params) {
-            Ok(params) => handler(self, params),
-            Err(err) => deserialize_error_output(method_label, &err),
-        }
-    }
-
-    fn unsupported_notification_output(&mut self, method: &str) -> HandlerOutput {
-        let mut output = HandlerOutput::default();
-        if !self.warned_unsupported_notification {
-            self.warned_unsupported_notification = true;
-            output.messages.push(log_message_event(format!(
-                "Ignoring unsupported notification: {method}"
-            )));
-        }
         output
     }
 }
