@@ -78,6 +78,7 @@ pub struct ServerState {
     published_sql_uri_order: VecDeque<Uri>,
     checker_cache: Option<CheckerCache>,
     last_config_error_message: Option<String>,
+    warned_incremental_change: bool,
     shutdown_requested: bool,
 }
 
@@ -115,6 +116,7 @@ impl ServerState {
             published_sql_uri_order: VecDeque::new(),
             checker_cache: None,
             last_config_error_message: None,
+            warned_incremental_change: false,
             shutdown_requested: false,
         }
     }
@@ -152,9 +154,12 @@ impl ServerState {
                 },
             );
             let mut output = self.clear_if_needed(uri, version);
-            output.messages.push(log_message_event(
-                "Received incremental textDocument/didChange despite full-sync capability; diagnostics were cleared.",
-            ));
+            if !self.warned_incremental_change {
+                self.warned_incremental_change = true;
+                output.messages.push(log_message_event(
+                    "Received incremental textDocument/didChange despite full-sync capability; diagnostics were cleared.",
+                ));
+            }
             return output;
         };
 
@@ -2210,5 +2215,59 @@ mod tests {
         assert_eq!(output.diagnostics.len(), 1);
         assert!(output.diagnostics[0].diagnostics.is_empty());
         assert_eq!(output.messages.len(), 1);
+    }
+
+    #[test]
+    fn repeated_incompatible_incremental_change_does_not_repeat_log() {
+        let root = temp_root();
+        let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+        let mut state = ServerState::new(root);
+        let uri = uri("file:///tmp/repeated-incremental.sql");
+        state.published_sql_uris.insert(uri.clone());
+
+        let first = state.handle_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 1,
+                    },
+                }),
+                range_length: Some(1),
+                text: "x".to_string(),
+            }],
+        });
+        assert_eq!(first.diagnostics.len(), 1);
+        assert_eq!(first.messages.len(), 1);
+
+        state.published_sql_uris.insert(uri.clone());
+        let second = state.handle_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier { uri, version: 3 },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 1,
+                    },
+                }),
+                range_length: Some(1),
+                text: "y".to_string(),
+            }],
+        });
+
+        assert_eq!(second.diagnostics.len(), 1);
+        assert!(second.messages.is_empty());
     }
 }
