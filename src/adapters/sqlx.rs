@@ -95,10 +95,10 @@ fn read_sqlx_metadata_prefix(file_path: &Utf8Path) -> std::io::Result<String> {
 
 impl SqlxAdapter {
     pub fn extract_migration_metadata_from_sql(sql: &str) -> MigrationContext {
-        // Scan every line for `-- no-transaction` (case-insensitive, trimmed)
-        let has_no_transaction = sql
-            .lines()
-            .any(|line| line.trim().eq_ignore_ascii_case("-- no-transaction"));
+        // Match SQLx's resolver behavior exactly: SQLx only opts out of
+        // wrapping a migration in a transaction when the file starts with this
+        // directive.
+        let has_no_transaction = sql.starts_with("-- no-transaction");
 
         MigrationContext {
             run_in_transaction: !has_no_transaction,
@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_metadata_directive_case_insensitive() {
+    fn test_extract_metadata_directive_must_match_sqlx_case() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let sql_file = temp_dir.path().join("20240101000000_add_index.sql");
         fs::write(&sql_file, "-- NO-TRANSACTION\nSELECT 1;\n").unwrap();
@@ -336,11 +336,11 @@ mod tests {
         let adapter = SqlxAdapter;
         let path = Utf8Path::from_path(&sql_file).unwrap();
         let meta = adapter.extract_migration_metadata(path);
-        assert!(!meta.run_in_transaction);
+        assert!(meta.run_in_transaction);
     }
 
     #[test]
-    fn test_extract_metadata_directive_anywhere_in_file() {
+    fn test_extract_metadata_directive_must_be_at_file_start() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let sql_file = temp_dir.path().join("20240101000000_add_index.sql");
         fs::write(&sql_file, "SELECT 1;\n-- no-transaction\nSELECT 2;\n").unwrap();
@@ -348,7 +348,7 @@ mod tests {
         let adapter = SqlxAdapter;
         let path = Utf8Path::from_path(&sql_file).unwrap();
         let meta = adapter.extract_migration_metadata(path);
-        assert!(!meta.run_in_transaction);
+        assert!(meta.run_in_transaction);
     }
 
     #[test]

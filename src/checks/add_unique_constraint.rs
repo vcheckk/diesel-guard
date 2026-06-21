@@ -71,7 +71,7 @@ Benefits:
 Considerations:
 - Cannot run inside a transaction block
   For Diesel migrations: Create metadata.toml with run_in_transaction = false
-  For SQLx migrations: Add -- no-transaction directive to the migration file
+  For SQLx migrations: Add -- no-transaction as the first line of the migration file
 - Takes longer than non-concurrent creation
 - May fail if duplicate values exist (leaves behind invalid index that should be dropped)",
                         index_name = suggested_index_name,

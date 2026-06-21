@@ -851,6 +851,36 @@ fn live_sqlx_diagnostics_use_in_memory_no_transaction_directive() {
 }
 
 #[test]
+fn live_sqlx_diagnostics_reject_misplaced_no_transaction_directive() {
+    let root = temp_root();
+    std::fs::write(
+        root.path().join("diesel-guard.toml"),
+        "framework = \"sqlx\"\nenable_checks = [\"AddIndexCheck\"]\n",
+    )
+    .unwrap();
+    let sql_path = root.path().join("20240101000000_add_idx.sql");
+    let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+    let mut state = ServerState::new(root);
+
+    let output = state.handle_open(DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: uri(&format!("file://{}", sql_path.display())),
+            language_id: "sql".to_string(),
+            version: 1,
+            text: "-- ordinary comment before directive\n-- no-transaction\nCREATE INDEX CONCURRENTLY idx_users_email ON users(email);".to_string(),
+        },
+    });
+
+    assert_eq!(output.diagnostics.len(), 1);
+    assert_eq!(output.diagnostics[0].diagnostics.len(), 1);
+    assert!(
+        output.diagnostics[0].diagnostics[0]
+            .message
+            .contains("inside a transaction")
+    );
+}
+
+#[test]
 fn load_from_workspace_without_config_returns_default() {
     let root = temp_root();
     let root_path = Utf8Path::from_path(root.path()).unwrap();

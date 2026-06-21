@@ -31,7 +31,7 @@ REINDEX TABLE CONCURRENTLY users;
 run_in_transaction = false
 ```
 
-**For SQLx migrations:** Add the no-transaction directive to your migration file:
+**For SQLx migrations:** Add the no-transaction directive as the first line of your migration file:
 
 ```sql
 -- no-transaction
