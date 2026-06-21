@@ -1,7 +1,37 @@
 use camino::Utf8Path;
-use diesel_guard::{Config, SafetyChecker};
+use diesel_guard::error::DieselGuardError;
+use diesel_guard::{Config, ConfigError, SafetyChecker};
 use std::fs;
 use tempfile::tempdir;
+
+#[test]
+fn test_invalid_start_after_returns_error() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let mig = temp_dir.path().join("20240101000000_create_users.sql");
+    fs::write(&mig, "SELECT 1;").unwrap();
+
+    let config = Config {
+        framework: "sqlx".to_string(),
+        start_after: Some("not-a-timestamp".to_string()),
+        ..Default::default()
+    };
+    let checker = SafetyChecker::with_config(config).unwrap();
+    let err = checker
+        .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            DieselGuardError::ConfigError(ConfigError::InvalidTimestampFormat(_))
+        ),
+        "Expected InvalidTimestampFormat, got: {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Invalid timestamp format: Invalid SQLx version format: not-a-timestamp. Expected: one or more digits"
+    );
+}
 
 #[test]
 fn test_concurrently_violations_include_sqlx_transaction_hint() {
@@ -19,6 +49,7 @@ fn test_concurrently_violations_include_sqlx_transaction_hint() {
         ..Default::default()
     };
     let results = SafetyChecker::with_config(config)
+        .unwrap()
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
 
@@ -32,7 +63,7 @@ fn test_concurrently_violations_include_sqlx_transaction_hint() {
         .expect("missing ADD INDEX without CONCURRENTLY violation");
     assert_eq!(
         add_index_without_concurrently.1.safe_alternative,
-        "Use CONCURRENTLY to build the index without blocking writes:\n   CREATE INDEX CONCURRENTLY idx_a ON users;\n\nNote: CONCURRENTLY takes longer and uses more resources, but allows concurrent INSERT, UPDATE, and DELETE operations. The index build may fail if there are deadlocks or unique constraint violations.\n\nConsiderations:\n- Requires more total work and takes longer to complete\n- If it fails, it leaves behind an \"invalid\" index that should be dropped\n\nNote: CONCURRENTLY cannot run inside a transaction block.\nAdd `-- no-transaction` to the migration file."
+        "Use CONCURRENTLY to build the index without blocking writes:\n   CREATE INDEX CONCURRENTLY idx_a ON users;\n\nNote: CONCURRENTLY takes longer and uses more resources, but allows concurrent INSERT, UPDATE, and DELETE operations. The index build may fail if there are deadlocks or unique constraint violations.\n\nConsiderations:\n- Requires more total work and takes longer to complete\n- If it fails, it leaves behind an \"invalid\" index that should be dropped\n\nNote: CONCURRENTLY cannot run inside a transaction block.\nAdd `-- no-transaction` as the first line of the migration file."
     );
 
     let drop_index_without_concurrently = violations
@@ -41,7 +72,7 @@ fn test_concurrently_violations_include_sqlx_transaction_hint() {
         .expect("missing DROP INDEX without CONCURRENTLY violation");
     assert_eq!(
         drop_index_without_concurrently.1.safe_alternative,
-        "Use CONCURRENTLY to drop the index without blocking queries:\n   DROP INDEX CONCURRENTLY idx_b;\n\nNote: CONCURRENTLY requires Postgres 9.2+.\n\nConsiderations:\n- Takes longer to complete than regular DROP INDEX\n- Allows concurrent SELECT, INSERT, UPDATE, DELETE operations\n- If it fails, the index may be marked \"invalid\" and should be dropped again\n- Cannot be rolled back (no transaction support)\n\nNote: CONCURRENTLY cannot run inside a transaction block.\nAdd `-- no-transaction` to the migration file."
+        "Use CONCURRENTLY to drop the index without blocking queries:\n   DROP INDEX CONCURRENTLY idx_b;\n\nNote: CONCURRENTLY requires Postgres 9.2+.\n\nConsiderations:\n- Takes longer to complete than regular DROP INDEX\n- Allows concurrent SELECT, INSERT, UPDATE, DELETE operations\n- If it fails, the index may be marked \"invalid\" and should be dropped again\n- Cannot be rolled back (no transaction support)\n\nNote: CONCURRENTLY cannot run inside a transaction block.\nAdd `-- no-transaction` as the first line of the migration file."
     );
 
     let reindex_without_concurrently = violations
@@ -50,7 +81,7 @@ fn test_concurrently_violations_include_sqlx_transaction_hint() {
         .expect("missing REINDEX without CONCURRENTLY violation");
     assert_eq!(
         reindex_without_concurrently.1.safe_alternative,
-        "Use REINDEX CONCURRENTLY for lock-free reindexing (Postgres 12+):\n\n   REINDEX INDEX CONCURRENTLY idx_a;\n\nNote: CONCURRENTLY requires Postgres 12+.\n\nConsiderations:\n- Takes longer to complete than regular REINDEX\n- Allows concurrent read/write operations\n- If it fails, the index may be left in \"invalid\" state and need manual cleanup\n- Cannot be rolled back (no transaction support)\n\nNote: CONCURRENTLY cannot run inside a transaction block.\nAdd `-- no-transaction` to the migration file."
+        "Use REINDEX CONCURRENTLY for lock-free reindexing (Postgres 12+):\n\n   REINDEX INDEX CONCURRENTLY idx_a;\n\nNote: CONCURRENTLY requires Postgres 12+.\n\nConsiderations:\n- Takes longer to complete than regular REINDEX\n- Allows concurrent read/write operations\n- If it fails, the index may be left in \"invalid\" state and need manual cleanup\n- Cannot be rolled back (no transaction support)\n\nNote: CONCURRENTLY cannot run inside a transaction block.\nAdd `-- no-transaction` as the first line of the migration file."
     );
 }
 
@@ -74,7 +105,7 @@ fn test_sqlx_numeric_version_comparison() {
         start_after: Some("2".to_string()),
         ..Default::default()
     };
-    let checker = SafetyChecker::with_config(config);
+    let checker = SafetyChecker::with_config(config).unwrap();
     let results = checker
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
@@ -103,7 +134,7 @@ fn test_sqlx_single_file_format_no_markers() {
         framework: "sqlx".to_string(),
         ..Default::default()
     };
-    let checker = SafetyChecker::with_config(config);
+    let checker = SafetyChecker::with_config(config).unwrap();
     let results = checker
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
@@ -138,7 +169,7 @@ fn test_sqlx_start_after_with_suffix_format() {
         start_after: Some("1".to_string()),
         ..Default::default()
     };
-    let checker = SafetyChecker::with_config(config);
+    let checker = SafetyChecker::with_config(config).unwrap();
     let results = checker
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
@@ -169,7 +200,7 @@ fn test_sqlx_check_down_suffix_format() {
         check_down: false,
         ..Default::default()
     };
-    let checker_no_down = SafetyChecker::with_config(config_no_down);
+    let checker_no_down = SafetyChecker::with_config(config_no_down).unwrap();
     let results_no_down = checker_no_down
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
@@ -183,7 +214,7 @@ fn test_sqlx_check_down_suffix_format() {
         check_down: true,
         ..Default::default()
     };
-    let checker_down = SafetyChecker::with_config(config_down);
+    let checker_down = SafetyChecker::with_config(config_down).unwrap();
     let results_down = checker_down
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
@@ -219,6 +250,7 @@ ALTER TABLE users ADD COLUMN admin BOOLEAN DEFAULT FALSE;
         ..Default::default()
     };
     let results = SafetyChecker::with_config(config)
+        .unwrap()
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
 

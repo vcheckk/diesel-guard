@@ -218,14 +218,14 @@ mod tests {
             &Config::default(),
             &MigrationContext {
                 run_in_transaction: true,
-                no_transaction_hint: "Add `-- no-transaction` to the migration file.",
+                no_transaction_hint: "Add `-- no-transaction` as the first line of the migration file.",
                 ..MigrationContext::default()
             },
         );
         assert_eq!(violations.len(), 1);
-        assert!(
-            violations[0].safe_alternative.contains("-- no-transaction"),
-            "Expected SQLx safe alternative message"
+        assert_eq!(
+            violations[0].safe_alternative,
+            "Add `-- no-transaction` as the first line of the migration file."
         );
     }
 
@@ -242,9 +242,9 @@ mod tests {
             },
         );
         assert_eq!(violations.len(), 1);
-        assert!(
-            violations[0].safe_alternative.contains("metadata.toml"),
-            "Expected Diesel safe alternative message"
+        assert_eq!(
+            violations[0].safe_alternative,
+            "Create `metadata.toml` in the migration directory with `run_in_transaction = false`."
         );
     }
 

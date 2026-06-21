@@ -1162,7 +1162,7 @@ fn custom_check_warnings_are_collected_for_lsp() {
         custom_checks_dir: Some(checks.to_str().unwrap().to_string()),
         ..Config::default()
     };
-    let (_checker, warnings) = SafetyChecker::with_config_and_warnings(config);
+    let (_checker, warnings) = SafetyChecker::with_config_and_warnings(config).unwrap();
 
     assert!(!warnings.is_empty());
 }

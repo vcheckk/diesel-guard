@@ -1,5 +1,6 @@
 use camino::Utf8Path;
-use diesel_guard::{Config, SafetyChecker};
+use diesel_guard::error::DieselGuardError;
+use diesel_guard::{Config, ConfigError, SafetyChecker};
 use std::fs;
 use tempfile::tempdir;
 
@@ -23,7 +24,7 @@ fn test_diesel_loose_sql_and_directory_migrations_coexist() {
         framework: "diesel".to_string(),
         ..Default::default()
     };
-    let checker = SafetyChecker::with_config(config);
+    let checker = SafetyChecker::with_config(config).unwrap();
     let results = checker
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
@@ -33,6 +34,36 @@ fn test_diesel_loose_sql_and_directory_migrations_coexist() {
         2,
         "Both directory and loose SQL migrations should be discovered, got: {:?}",
         results.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_invalid_start_after_returns_error() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let mig = temp_dir.path().join("2024_01_01_000000_create_users");
+    fs::create_dir(&mig).unwrap();
+    fs::write(mig.join("up.sql"), "SELECT 1;").unwrap();
+
+    let config = Config {
+        framework: "diesel".to_string(),
+        start_after: Some("not-a-timestamp".to_string()),
+        ..Default::default()
+    };
+    let checker = SafetyChecker::with_config(config).unwrap();
+    let err = checker
+        .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            DieselGuardError::ConfigError(ConfigError::InvalidTimestampFormat(_))
+        ),
+        "Expected InvalidTimestampFormat, got: {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Invalid timestamp format: Invalid Diesel timestamp format: not-a-timestamp. Expected: YYYYMMDDHHMMSS, YYYY_MM_DD_HHMMSS, or YYYY-MM-DD-HHMMSS"
     );
 }
 
@@ -61,7 +92,7 @@ fn test_diesel_mixed_timestamp_separators() {
         start_after: Some("2024_01_01_000000".to_string()),
         ..Default::default()
     };
-    let checker = SafetyChecker::with_config(config);
+    let checker = SafetyChecker::with_config(config).unwrap();
     let results = checker
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
@@ -99,6 +130,7 @@ fn test_concurrently_violations_include_diesel_transaction_hint() {
         ..Default::default()
     };
     let results = SafetyChecker::with_config(config)
+        .unwrap()
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
 
@@ -147,7 +179,7 @@ fn test_diesel_no_separator_timestamp() {
         framework: "diesel".to_string(),
         ..Default::default()
     };
-    let checker = SafetyChecker::with_config(config);
+    let checker = SafetyChecker::with_config(config).unwrap();
     let results = checker
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
@@ -187,6 +219,7 @@ disable_checks = ["AddColumnCheck"]
         ..Default::default()
     };
     let results = SafetyChecker::with_config(config)
+        .unwrap()
         .check_directory(Utf8Path::from_path(temp_dir.path()).unwrap())
         .unwrap();
 

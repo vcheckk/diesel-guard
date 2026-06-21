@@ -21,7 +21,8 @@ use std::sync::LazyLock;
 static SQLX_VERSION_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+)(_|\.)?").expect("valid regex pattern"));
 
-const NO_TRANSACTION_HINT: &str = "Add `-- no-transaction` to the migration file.";
+const NO_TRANSACTION_HINT: &str =
+    "Add `-- no-transaction` as the first line of the migration file.";
 const MAX_SQLX_METADATA_SCAN_BYTES: u64 = 16 * 1024 * 1024;
 
 /// SQLx migration adapter.
@@ -34,7 +35,7 @@ impl MigrationAdapter for SqlxAdapter {
         start_after: Option<&str>,
         check_down: bool,
     ) -> Result<Vec<MigrationFile>> {
-        let entries = collect_and_sort_entries(dir);
+        let entries = collect_and_sort_entries(dir)?;
         let mut files = Vec::new();
 
         for entry in entries {

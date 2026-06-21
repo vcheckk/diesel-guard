@@ -33,7 +33,7 @@ impl ServerState {
             return Ok((checker, Vec::new()));
         }
 
-        Ok(self.build_cached_checker(config, key, cache_warnings))
+        self.build_cached_checker(config, key, cache_warnings)
     }
 
     fn load_checker_inputs(
@@ -60,8 +60,8 @@ impl ServerState {
         config: Config,
         key: CheckerCacheKey,
         cache_warnings: Vec<String>,
-    ) -> (Arc<SafetyChecker>, Vec<String>) {
-        let (checker, mut warnings) = SafetyChecker::with_config_and_warnings(config);
+    ) -> std::result::Result<(Arc<SafetyChecker>, Vec<String>), ConfigError> {
+        let (checker, mut warnings) = SafetyChecker::with_config_and_warnings(config)?;
         warnings.splice(0..0, cache_warnings);
         let checker = Arc::new(checker);
         self.checker_cache = Some(CheckerCache {
@@ -69,6 +69,6 @@ impl ServerState {
             checker: Arc::clone(&checker),
         });
         self.last_config_error_message = None;
-        (checker, warnings)
+        Ok((checker, warnings))
     }
 }

@@ -129,11 +129,11 @@ EXAMPLES:
   diesel-guard dump-ast --file migrations/20240101/up.sql")]
     DumpAst {
         /// SQL string to parse
-        #[arg(long)]
+        #[arg(long, conflicts_with = "file", required_unless_present = "file")]
         sql: Option<String>,
 
         /// Path to a .sql file to parse
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sql", required_unless_present = "sql")]
         file: Option<Utf8PathBuf>,
     },
 
@@ -163,7 +163,7 @@ EXAMPLES:
 
 fn run_check(path: &camino::Utf8Path, format: Format) -> Result<()> {
     let config = Config::load().map_err(|e| miette::miette!(e))?;
-    let checker = SafetyChecker::with_config(config);
+    let checker = SafetyChecker::with_config(config).map_err(|e| miette::miette!(e))?;
     let results = checker.check_path(path)?;
     let total_errors: usize = results
         .iter()
@@ -184,7 +184,8 @@ fn load_all_checks() -> Result<(Config, SafetyChecker)> {
         disable_checks: vec![],
         enable_checks: vec![],
         ..config.clone()
-    });
+    })
+    .map_err(|e| miette::miette!(e))?;
     Ok((config, checker))
 }
 
@@ -236,10 +237,7 @@ fn main() -> Result<()> {
                 (Some(s), _) => s,
                 (None, Some(path)) => read_sql_file_to_string(&path)
                     .map_err(|e| miette::miette!("Failed to read file '{}': {}", path, e))?,
-                (None, None) => {
-                    eprintln!("Error: provide either --sql or --file");
-                    exit(1);
-                }
+                (None, None) => unreachable!(),
             };
 
             let json = ast_dump::dump_ast(&sql_input)?;
