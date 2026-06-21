@@ -11,7 +11,7 @@ use std::io::{self, BufRead, BufReader, Read};
 pub const MAX_SQL_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 
 pub fn read_sql_file_to_string(path: &Utf8Path) -> Result<String> {
-    let file = crate::file_read::open_regular_file!(
+    let file = crate::file_read::open_regular_file(
         path.as_std_path(),
         "SQL input path is not a regular file",
     )?;

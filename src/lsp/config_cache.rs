@@ -204,7 +204,7 @@ pub(super) fn file_content_hash(
     path: &std::path::Path,
 ) -> std::result::Result<Option<(u64, u64)>, ConfigError> {
     let Ok(file) =
-        crate::file_read::open_regular_file!(path, "custom check path is not a regular file")
+        crate::file_read::open_regular_file(path, "custom check path is not a regular file")
     else {
         return Ok(None);
     };
@@ -239,7 +239,7 @@ pub(super) fn read_file_to_string_with_limit(
 
 pub(super) fn read_file_bytes_with_limit(path: &Utf8Path, limit: u64) -> std::io::Result<Vec<u8>> {
     let file =
-        crate::file_read::open_regular_file!(path.as_std_path(), "path is not a regular file")?;
+        crate::file_read::open_regular_file(path.as_std_path(), "path is not a regular file")?;
     let mut reader = file.take(limit.saturating_add(1));
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;

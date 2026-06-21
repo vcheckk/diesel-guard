@@ -82,7 +82,7 @@ impl MigrationAdapter for SqlxAdapter {
 }
 
 fn read_sqlx_metadata_prefix(file_path: &Utf8Path) -> std::io::Result<String> {
-    let file = crate::file_read::open_regular_file!(
+    let file = crate::file_read::open_regular_file(
         file_path.as_std_path(),
         "SQLx metadata path is not a regular file",
     )?;

@@ -247,7 +247,7 @@ fn read_regular_file_to_string_with_limit(
     path: &Utf8Path,
     max_bytes: u64,
 ) -> Result<String, ConfigError> {
-    let file = crate::file_read::open_regular_file!(
+    let file = crate::file_read::open_regular_file(
         path.as_std_path(),
         "config path is not a regular file",
     )?;

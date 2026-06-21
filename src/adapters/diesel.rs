@@ -132,7 +132,7 @@ impl MigrationAdapter for DieselAdapter {
 }
 
 fn read_metadata_toml(metadata_path: &Utf8Path) -> Option<String> {
-    let file = crate::file_read::open_regular_file!(
+    let file = crate::file_read::open_regular_file(
         metadata_path.as_std_path(),
         "Diesel metadata path is not a regular file",
     )
