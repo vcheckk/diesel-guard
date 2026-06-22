@@ -1,5 +1,5 @@
 use super::{
-    CheckerCacheKey, CustomCheckFileSignature, DocumentState, LimitedFileRead,
+    CheckerCacheKey, CustomCheckFileSignature, DocumentState, LimitedFileRead, MAX_CONFIG_BYTES,
     MAX_LIVE_DOCUMENT_BYTES, MAX_LSP_CUSTOM_CHECK_FILES, MAX_LSP_CUSTOM_CHECK_TOTAL_SOURCE_BYTES,
     MAX_SAVED_DOCUMENT_BYTES,
 };
@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 
 pub fn load_lsp_config(root: &Utf8Path) -> std::result::Result<Config, ConfigError> {
-    let mut config = Config::load_from_dir(root)?;
+    let mut config = Config::load_from_dir_with_limit(root, MAX_CONFIG_BYTES)?;
     if let Some(custom_checks_dir) = config.custom_checks_dir.as_deref() {
         let path = Utf8Path::new(custom_checks_dir);
         if path.is_relative() {
@@ -203,7 +203,9 @@ pub(super) fn custom_check_signature_from_parts(
 pub(super) fn file_content_hash(
     path: &std::path::Path,
 ) -> std::result::Result<Option<(u64, u64)>, ConfigError> {
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(file) =
+        crate::file_read::open_regular_file(path, "custom check path is not a regular file")
+    else {
         return Ok(None);
     };
     let mut reader = file.take(MAX_CUSTOM_CHECK_SOURCE_BYTES.saturating_add(1));
@@ -236,7 +238,8 @@ pub(super) fn read_file_to_string_with_limit(
 }
 
 pub(super) fn read_file_bytes_with_limit(path: &Utf8Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
+    let file =
+        crate::file_read::open_regular_file(path.as_std_path(), "path is not a regular file")?;
     let mut reader = file.take(limit.saturating_add(1));
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;

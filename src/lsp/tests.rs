@@ -775,6 +775,24 @@ fn config_loading_from_workspace_normalizes_custom_checks_dir() {
 }
 
 #[test]
+fn lsp_config_loader_rejects_oversized_config() {
+    let root = temp_root();
+    std::fs::write(
+        root.path().join("diesel-guard.toml"),
+        format!(
+            "framework = \"diesel\"\n# {}\n",
+            "x".repeat(usize::try_from(MAX_CONFIG_BYTES).unwrap())
+        ),
+    )
+    .unwrap();
+    let root_path = Utf8Path::from_path(root.path()).unwrap();
+
+    let err = load_lsp_config(root_path).unwrap_err();
+
+    assert!(matches!(err, ConfigError::ConfigTooLarge { .. }));
+}
+
+#[test]
 fn live_diesel_diagnostics_use_metadata_toml() {
     let root = temp_root();
     let migration_dir = root.path().join("2024_01_01_000000_add_idx");
@@ -1206,6 +1224,33 @@ fn saved_file_reader_enforces_limit_during_read() {
     let result = read_file_to_string_with_limit(path, MAX_SAVED_DOCUMENT_BYTES).unwrap();
 
     assert!(matches!(result, LimitedFileRead::TooLarge));
+}
+
+#[test]
+fn saved_file_reader_rejects_non_regular_path() {
+    let root = temp_root();
+    let path = root.path().join("directory.sql");
+    std::fs::create_dir(&path).unwrap();
+    let path = Utf8Path::from_path(&path).unwrap();
+
+    let err = read_file_to_string_with_limit(path, MAX_SAVED_DOCUMENT_BYTES).unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_file_reader_rejects_symlinked_sql_file() {
+    let root = temp_root();
+    let target = root.path().join("target.txt");
+    let link = root.path().join("linked.sql");
+    std::fs::write(&target, "SELECT 1;").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let path = Utf8Path::from_path(&link).unwrap();
+
+    let err = read_file_to_string_with_limit(path, MAX_SAVED_DOCUMENT_BYTES).unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[test]

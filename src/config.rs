@@ -5,7 +5,10 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use thiserror::Error;
+
+pub const DEFAULT_CONFIG_MAX_BYTES: u64 = 64 * 1024;
 
 /// Generate help text for invalid check names from the registry
 fn valid_check_names_help() -> String {
@@ -40,6 +43,9 @@ pub enum ConfigError {
 
     #[error("Custom checks directory is too large for LSP diagnostics: {message}")]
     CustomChecksTooLarge { message: String },
+
+    #[error("Config file is larger than {max_bytes} bytes: {path}")]
+    ConfigTooLarge { path: String, max_bytes: u64 },
 }
 
 impl Diagnostic for ConfigError {
@@ -61,6 +67,7 @@ impl Diagnostic for ConfigError {
             Self::CustomChecksTooLarge { .. } => {
                 Some(Box::new("diesel_guard::config::custom_checks_too_large"))
             }
+            Self::ConfigTooLarge { .. } => Some(Box::new("diesel_guard::config::too_large")),
         }
     }
 
@@ -79,6 +86,9 @@ impl Diagnostic for ConfigError {
             )),
             Self::CustomChecksTooLarge { .. } => Some(Box::new(
                 "Reduce the number or total size of Rhai custom checks used by the editor LSP.",
+            )),
+            Self::ConfigTooLarge { .. } => Some(Box::new(
+                "Reduce diesel-guard.toml to a normal project configuration file size.",
             )),
             _ => None,
         }
@@ -149,7 +159,13 @@ impl Config {
 
     /// Load config from specific path (useful for testing)
     pub fn load_from_path(path: &Utf8Path) -> Result<Self, ConfigError> {
-        let contents = std::fs::read_to_string(path)?;
+        let contents = read_regular_file_to_string_with_limit(path, DEFAULT_CONFIG_MAX_BYTES)?;
+        Self::load_from_str(&contents)
+    }
+
+    /// Load config from a specific path with a maximum byte count.
+    pub fn load_from_path_with_limit(path: &Utf8Path, max_bytes: u64) -> Result<Self, ConfigError> {
+        let contents = read_regular_file_to_string_with_limit(path, max_bytes)?;
         Self::load_from_str(&contents)
     }
 
@@ -178,6 +194,17 @@ impl Config {
         }
 
         Self::load_from_path(&config_path)
+    }
+
+    /// Load config from `diesel-guard.toml` in a directory with a maximum byte count.
+    pub fn load_from_dir_with_limit(root: &Utf8Path, max_bytes: u64) -> Result<Self, ConfigError> {
+        let config_path = root.join("diesel-guard.toml");
+
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+
+        Self::load_from_path_with_limit(&config_path, max_bytes)
     }
 
     /// Validate configuration values
@@ -211,6 +238,27 @@ impl Config {
         }
         !self.disable_checks.iter().any(|c| c == check_name)
     }
+}
+
+fn read_regular_file_to_string_with_limit(
+    path: &Utf8Path,
+    max_bytes: u64,
+) -> Result<String, ConfigError> {
+    let file = crate::file_read::open_regular_file(
+        path.as_std_path(),
+        "config path is not a regular file",
+    )?;
+    let mut reader = file.take(max_bytes.saturating_add(1));
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(ConfigError::ConfigTooLarge {
+            path: path.to_string(),
+            max_bytes,
+        });
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err).into())
 }
 
 impl Default for Config {
@@ -310,6 +358,21 @@ disable_checks = ["AddColumnCheck"]
         assert_eq!(config.start_after, Some("2024_01_01_000000".to_string()));
         assert!(config.check_down);
         assert_eq!(config.disable_checks, vec!["AddColumnCheck".to_string()]);
+    }
+
+    #[test]
+    fn test_load_from_path_rejects_oversized_config() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let config_path = temp_dir.path().join("diesel-guard.toml");
+        fs::write(
+            &config_path,
+            "x".repeat(usize::try_from(DEFAULT_CONFIG_MAX_BYTES).unwrap() + 1),
+        )
+        .unwrap();
+
+        let config_path_utf8 = Utf8Path::from_path(&config_path).unwrap();
+        let err = Config::load_from_path(config_path_utf8).unwrap_err();
+        assert!(matches!(err, ConfigError::ConfigTooLarge { .. }));
     }
 
     #[test]

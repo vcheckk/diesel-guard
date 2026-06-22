@@ -6,10 +6,33 @@ use crate::error::Result;
 use crate::parser;
 use crate::scripting;
 use camino::Utf8Path;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
+
+pub const MAX_SQL_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 
 pub fn read_sql_file_to_string(path: &Utf8Path) -> Result<String> {
-    Ok(std::fs::read_to_string(path)?)
+    let file = crate::file_read::open_regular_file(
+        path.as_std_path(),
+        "SQL input path is not a regular file",
+    )?;
+    let mut reader = BufReader::new(file);
+    read_sql_reader_to_string(&mut reader, path.as_str())
+}
+
+fn read_sql_reader_to_string(reader: &mut dyn Read, source: &str) -> Result<String> {
+    let mut limited_reader = reader.take(MAX_SQL_INPUT_BYTES.saturating_add(1));
+    let mut buffer = Vec::new();
+    limited_reader.read_to_end(&mut buffer)?;
+
+    if u64::try_from(buffer.len()).unwrap_or(u64::MAX) > MAX_SQL_INPUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SQL input '{source}' is larger than {MAX_SQL_INPUT_BYTES} bytes"),
+        )
+        .into());
+    }
+
+    String::from_utf8(buffer).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err).into())
 }
 
 pub struct SafetyChecker {
@@ -310,8 +333,7 @@ impl SafetyChecker {
 
     // check a migration string from a buffer
     fn check_buffer(&self, reader: &mut dyn BufRead) -> Result<ViolationList> {
-        let mut buffer = String::new();
-        reader.read_to_string(&mut buffer)?;
+        let buffer = read_sql_reader_to_string(reader, "stdin")?;
         self.check_sql(&buffer)
     }
 
@@ -843,6 +865,77 @@ mod tests {
         assert_eq!(results.len(), 1, "Expected one file with violations");
         assert!(results[0].0.contains("migration.sql"));
         assert!(!results[0].1.is_empty());
+    }
+
+    #[test]
+    fn test_check_file_rejects_oversized_sql_input() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("huge.sql");
+        std::fs::write(
+            &file,
+            " ".repeat(usize::try_from(MAX_SQL_INPUT_BYTES).unwrap() + 1),
+        )
+        .unwrap();
+
+        let checker = SafetyChecker::with_config(Config::default()).unwrap();
+        let path = Utf8Path::from_path(&file).unwrap();
+        let err = checker.check_file(path).unwrap_err();
+
+        match err {
+            crate::error::DieselGuardError::IoError(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    err.to_string().contains("is larger than 16777216 bytes"),
+                    "expected oversized SQL input error, got: {err}"
+                );
+            }
+            other => panic!("expected oversized SQL input io error, got: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_rejects_sql_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.sql");
+        let link = dir.path().join("link.sql");
+        std::fs::write(&target, "SELECT 1;").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let checker = SafetyChecker::with_config(Config::default()).unwrap();
+        let path = Utf8Path::from_path(&link).unwrap();
+        let err = checker.check_file(path).unwrap_err();
+
+        match err {
+            crate::error::DieselGuardError::IoError(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(err.to_string(), "SQL input path is not a regular file");
+            }
+            other => panic!("expected symlink rejection io error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_buffer_rejects_oversized_sql_input() {
+        let checker = SafetyChecker::with_config(Config::default()).unwrap();
+        let oversized = " ".repeat(usize::try_from(MAX_SQL_INPUT_BYTES).unwrap() + 1);
+        let mut reader = BufReader::new(Cursor::new(oversized));
+
+        let err = checker.check_buffer(&mut reader).unwrap_err();
+
+        match err {
+            crate::error::DieselGuardError::IoError(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    err.to_string()
+                        .contains("SQL input 'stdin' is larger than 16777216 bytes"),
+                    "expected oversized stdin SQL input error, got: {err}"
+                );
+            }
+            other => panic!("expected oversized stdin SQL input io error, got: {other:?}"),
+        }
     }
 
     #[test]
