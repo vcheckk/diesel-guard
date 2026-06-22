@@ -45,6 +45,95 @@ fn initialize_capabilities_advertise_full_sync_and_save() {
 }
 
 #[test]
+fn initialize_connection_selects_workspace_root_and_replies() {
+    let root = temp_root();
+    let root_uri = uri(&format!("file://{}", root.path().display()));
+    let selected_root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+    let (server, client) = Connection::memory();
+    let lsp_server::Connection { sender, receiver } = client;
+    let request_id = RequestId::from(3);
+
+    sender
+        .send(Message::Request(lsp_server::Request::new(
+            request_id.clone(),
+            "initialize".to_string(),
+            json!({
+                "capabilities": {},
+                "workspaceFolders": [{
+                    "uri": root_uri.to_string(),
+                    "name": "workspace"
+                }]
+            }),
+        )))
+        .unwrap();
+    sender
+        .send(Message::Notification(Notification::new(
+            lsp_types::notification::Initialized::METHOD.to_string(),
+            json!(null),
+        )))
+        .unwrap();
+
+    assert_eq!(initialize_connection(&server).unwrap(), selected_root);
+    let Message::Response(response) = receiver.try_recv().unwrap() else {
+        panic!("expected initialize response");
+    };
+    assert_eq!(response.id, request_id);
+    assert!(response.error.is_none());
+}
+
+#[test]
+fn run_initialized_session_handles_initialize_shutdown_and_exit() {
+    let root = temp_root();
+    let root_uri = uri(&format!("file://{}", root.path().display()));
+    let (server, client) = Connection::memory();
+    let lsp_server::Connection { sender, receiver } = client;
+
+    sender
+        .send(Message::Request(lsp_server::Request::new(
+            RequestId::from(5),
+            "initialize".to_string(),
+            json!({
+                "capabilities": {},
+                "workspaceFolders": [{
+                    "uri": root_uri.to_string(),
+                    "name": "workspace"
+                }]
+            }),
+        )))
+        .unwrap();
+    sender
+        .send(Message::Notification(Notification::new(
+            lsp_types::notification::Initialized::METHOD.to_string(),
+            json!(null),
+        )))
+        .unwrap();
+    sender
+        .send(Message::Request(lsp_server::Request::new(
+            RequestId::from(6),
+            "shutdown".to_string(),
+            json!(null),
+        )))
+        .unwrap();
+    sender
+        .send(Message::Notification(Notification::new(
+            lsp_types::notification::Exit::METHOD.to_string(),
+            json!(null),
+        )))
+        .unwrap();
+    drop(sender);
+
+    assert_eq!(run_initialized_session(server).unwrap(), 0);
+    let Message::Response(initialize_response) = receiver.try_recv().unwrap() else {
+        panic!("expected initialize response");
+    };
+    assert!(initialize_response.error.is_none());
+    let Message::Response(shutdown_response) = receiver.try_recv().unwrap() else {
+        panic!("expected shutdown response");
+    };
+    assert!(shutdown_response.error.is_none());
+}
+
+#[test]
 fn unsupported_request_uses_method_not_found() {
     let response = unsupported_request_response(RequestId::from(1), "workspace/symbol");
     assert_eq!(

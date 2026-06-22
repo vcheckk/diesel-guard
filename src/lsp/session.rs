@@ -18,12 +18,17 @@ pub fn run() -> Result<()> {
 }
 
 pub(super) fn run_stdio_session(connection: Connection, io_threads: IoThreads) -> Result<()> {
-    let root = initialize_connection(&connection)?;
-    let exit_code = ServerState::new(root).run_loop(&connection)?;
-    drop(connection);
+    let exit_code = run_initialized_session(connection)?;
     io_threads.join()?;
     exit_with_code(exit_code);
     Ok(())
+}
+
+pub(super) fn run_initialized_session(connection: Connection) -> Result<i32> {
+    let root = initialize_connection(&connection)?;
+    let exit_code = ServerState::new(root).run_loop(&connection)?;
+    drop(connection);
+    Ok(exit_code)
 }
 
 pub(super) fn initialize_connection(connection: &Connection) -> Result<Utf8PathBuf> {

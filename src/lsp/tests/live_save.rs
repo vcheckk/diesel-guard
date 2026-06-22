@@ -168,6 +168,48 @@ fn saved_unreadable_sql_file_falls_back_to_editor_text() {
 }
 
 #[test]
+fn saved_file_uri_without_local_path_or_text_clears_and_reports_error() {
+    let root = temp_root();
+    let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+    let mut state = ServerState::new(root);
+    let uri = uri("file://db.example/tmp/remote.sql");
+    state.track_published_uri(&uri);
+
+    let output = state.handle_save(DidSaveTextDocumentParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        text: None,
+    });
+
+    assert_eq!(output.diagnostics.len(), 1);
+    assert!(output.diagnostics[0].diagnostics.is_empty());
+    assert_eq!(output.messages.len(), 1);
+    assert_eq!(output.messages[0].typ, MessageType::ERROR);
+    assert!(
+        output.messages[0]
+            .message
+            .contains("no readable file path or in-memory text")
+    );
+    assert!(!state.published_sql_uris.contains(&uri));
+}
+
+#[test]
+fn saved_file_uri_without_local_path_uses_explicit_text() {
+    let root = temp_root();
+    let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+    let mut state = ServerState::new(root);
+    let uri = uri("file://db.example/tmp/remote.sql");
+
+    let output = state.handle_save(DidSaveTextDocumentParams {
+        text_document: TextDocumentIdentifier { uri },
+        text: Some("ALTER TABLE users ADD COLUMN admin BOOLEAN DEFAULT FALSE;".to_string()),
+    });
+
+    assert_eq!(output.diagnostics.len(), 1);
+    assert!(!output.diagnostics[0].diagnostics.is_empty());
+    assert!(output.messages.is_empty());
+}
+
+#[test]
 fn oversized_live_sql_document_skips_diagnostics() {
     let root = temp_root();
     let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();

@@ -38,7 +38,7 @@ use diagnostics::{check_live_sql, empty_event, final_full_sync_text};
 pub use protocol::unsupported_request_response;
 use protocol::{log_message_event, show_error_event};
 #[cfg(test)]
-use session::document_notification_kind;
+use session::{document_notification_kind, initialize_connection, run_initialized_session};
 pub use session::{initialize_result, run, select_workspace_root};
 use transport::DocumentNotificationKind;
 #[cfg(test)]

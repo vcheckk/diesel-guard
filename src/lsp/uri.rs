@@ -1,9 +1,11 @@
+use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use lsp_types::Uri;
 
 pub fn is_sql_file_uri(uri: &Uri) -> bool {
-    file_uri_to_path(uri).is_some_and(|path| {
-        path.extension()
+    file_uri_path(uri).is_some_and(|path| {
+        Utf8Path::new(&path)
+            .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
     })
 }
@@ -21,6 +23,18 @@ pub fn file_uri_to_path(uri: &Uri) -> Option<Utf8PathBuf> {
 
 pub(super) fn strip_file_uri(uri: &Uri) -> Option<&str> {
     uri.as_str().strip_prefix("file://")
+}
+
+pub(super) fn file_uri_path(uri: &Uri) -> Option<String> {
+    let rest = strip_file_uri(uri)?;
+    let path = if let Some(path) = rest.strip_prefix('/') {
+        format!("/{path}")
+    } else {
+        let slash = rest.find('/')?;
+        rest[slash..].to_string()
+    };
+    let path = path_without_query_or_fragment(&path);
+    percent_decode_utf8(path).ok()
 }
 
 pub(super) fn file_uri_local_path(rest: &str) -> Option<String> {

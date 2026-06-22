@@ -3,7 +3,9 @@ use super::*;
 #[test]
 fn sql_file_uri_filter_accepts_only_file_sql() {
     assert!(is_sql_file_uri(&uri("file:///tmp/migration.sql")));
+    assert!(is_sql_file_uri(&uri("file://db.example/tmp/migration.sql")));
     assert!(!is_sql_file_uri(&uri("file:///tmp/readme.txt")));
+    assert!(!is_sql_file_uri(&uri("file:///tmp/%FF.sql")));
     assert!(!is_sql_file_uri(&uri("untitled:///migration.sql")));
 }
 

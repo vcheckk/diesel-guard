@@ -846,6 +846,53 @@ mod tests {
     }
 
     #[test]
+    fn test_check_file_with_warnings_collects_unknown_disable_warning() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("migration.sql");
+        std::fs::write(
+            &file,
+            "-- diesel-guard:disable FakeCheckThatDoesNotExist\nALTER TABLE users ADD COLUMN admin BOOLEAN DEFAULT FALSE;",
+        )
+        .unwrap();
+        let checker = SafetyChecker::with_config(Config {
+            enable_checks: vec!["AddColumnCheck".to_string()],
+            ..Config::default()
+        })
+        .unwrap();
+        let path = Utf8Path::from_path(&file).unwrap();
+
+        let (violations, warnings) = checker.check_file_with_warnings(path).unwrap();
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("FakeCheckThatDoesNotExist"));
+        assert!(warnings[0].contains("migration-scoped disable_checks"));
+    }
+
+    #[test]
+    fn test_check_file_with_warnings_uses_sqlx_snapshot_metadata() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("20240101000000_add_idx.sql");
+        std::fs::write(
+            &file,
+            "-- no-transaction\nCREATE INDEX CONCURRENTLY idx_users_email ON users(email);",
+        )
+        .unwrap();
+        let checker = SafetyChecker::with_config(Config {
+            framework: "sqlx".to_string(),
+            enable_checks: vec!["AddIndexCheck".to_string()],
+            ..Config::default()
+        })
+        .unwrap();
+        let path = Utf8Path::from_path(&file).unwrap();
+
+        let (violations, warnings) = checker.check_file_with_warnings(path).unwrap();
+
+        assert!(violations.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn test_check_sql_warns_on_duplicate_migration_disabled_checks() {
         let checker = SafetyChecker::default();
         // Duplicate name in disable directive — warn_unknown_migration_disabled_checks deduplicates.
