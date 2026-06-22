@@ -4,6 +4,7 @@
 - [Installation](installation.md)
 - [Quick Start](quickstart.md)
 - [Configuration](configuration.md)
+- [Editor Integration](editor-integration.md)
 - [Framework Adapters](frameworks.md)
 - [Checks](checks/overview.md)
   - [Add Check Constraint](checks/add-check-constraint.md)

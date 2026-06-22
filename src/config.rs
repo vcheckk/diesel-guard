@@ -37,6 +37,12 @@ pub enum ConfigError {
 
     #[error("enable_checks and disable_checks cannot both be set")]
     ConflictingCheckConfig,
+
+    #[error("Custom checks directory is too large for LSP diagnostics: {message}")]
+    CustomChecksTooLarge { message: String },
+
+    #[error("Config file is larger than {max_bytes} bytes: {path}")]
+    ConfigTooLarge { path: String, max_bytes: u64 },
 }
 
 impl Diagnostic for ConfigError {
@@ -55,6 +61,10 @@ impl Diagnostic for ConfigError {
             Self::ConflictingCheckConfig => {
                 Some(Box::new("diesel_guard::config::conflicting_check_config"))
             }
+            Self::CustomChecksTooLarge { .. } => {
+                Some(Box::new("diesel_guard::config::custom_checks_too_large"))
+            }
+            Self::ConfigTooLarge { .. } => Some(Box::new("diesel_guard::config::too_large")),
         }
     }
 
@@ -70,6 +80,12 @@ impl Diagnostic for ConfigError {
             Self::InvalidFramework { .. } => Some(Box::new("Valid values: \"diesel\", \"sqlx\"")),
             Self::ConflictingCheckConfig => Some(Box::new(
                 "Use either enable_checks (whitelist) or disable_checks (blacklist), not both.",
+            )),
+            Self::CustomChecksTooLarge { .. } => Some(Box::new(
+                "Reduce the number or total size of Rhai custom checks used by the editor LSP.",
+            )),
+            Self::ConfigTooLarge { .. } => Some(Box::new(
+                "Reduce diesel-guard.toml to a normal project configuration file size.",
             )),
             _ => None,
         }
@@ -141,7 +157,11 @@ impl Config {
     /// Load config from specific path (useful for testing)
     pub fn load_from_path(path: &Utf8Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&contents).map_err(|e| {
+        Self::load_from_str(&contents)
+    }
+
+    pub(crate) fn load_from_str(contents: &str) -> Result<Self, ConfigError> {
+        let config: Config = toml::from_str(contents).map_err(|e| {
             // Check if the error is due to missing framework field
             if e.to_string().contains("missing field `framework`") {
                 ConfigError::MissingFramework
@@ -151,6 +171,20 @@ impl Config {
         })?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Load config from `diesel-guard.toml` in a specific directory.
+    ///
+    /// This preserves the caller's current working directory and returns the
+    /// default configuration when the target directory has no config file.
+    pub fn load_from_dir(root: &Utf8Path) -> Result<Self, ConfigError> {
+        let config_path = root.join("diesel-guard.toml");
+
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+
+        Self::load_from_path(&config_path)
     }
 
     /// Validate configuration values
@@ -250,7 +284,7 @@ mod tests {
         let help = error.help().unwrap().to_string();
 
         // Verify help text includes all check names from the registry
-        for &check_name in crate::checks::Registry::builtin_check_names() {
+        for check_name in crate::checks::Registry::builtin_check_names() {
             assert!(
                 help.contains(check_name),
                 "Help text should include '{check_name}', got: {help}"

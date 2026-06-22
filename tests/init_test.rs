@@ -129,3 +129,16 @@ fn test_init_preserves_other_files() {
     assert!(temp_dir.path().join("migrations").exists());
     assert!(temp_dir.path().join("diesel-guard.toml").exists());
 }
+
+#[test]
+fn test_help_lists_lsp_subcommand() {
+    let output = Command::cargo_bin("diesel-guard")
+        .unwrap()
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("lsp"));
+}

@@ -26,6 +26,7 @@ static DIESEL_TIMESTAMP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 const NO_TRANSACTION_HINT: &str =
     "Create `metadata.toml` in the migration directory with `run_in_transaction = false`.";
+const MAX_METADATA_BYTES: u64 = 64 * 1024;
 
 /// Diesel migration adapter.
 pub struct DieselAdapter;
@@ -111,7 +112,7 @@ impl MigrationAdapter for DieselAdapter {
         };
         let metadata_path = parent.join("metadata.toml");
 
-        let Ok(content) = std::fs::read_to_string(&metadata_path) else {
+        let Some(content) = read_metadata_toml(&metadata_path) else {
             return MigrationContext {
                 run_in_transaction: true,
                 no_transaction_hint: NO_TRANSACTION_HINT,
@@ -127,6 +128,17 @@ impl MigrationAdapter for DieselAdapter {
             disabled_checks: parsed.disable_checks,
         }
     }
+}
+
+fn read_metadata_toml(metadata_path: &Utf8Path) -> Option<String> {
+    let bytes = crate::file_read::read_regular_file_bytes_with_limit(
+        metadata_path.as_std_path(),
+        MAX_METADATA_BYTES,
+        "Diesel metadata path is not a regular file",
+    )
+    .ok()?;
+    (u64::try_from(bytes.len()).ok()? <= MAX_METADATA_BYTES).then_some(())?;
+    String::from_utf8(bytes).ok()
 }
 
 impl DieselAdapter {
@@ -356,6 +368,42 @@ mod tests {
             "this is not valid toml ][[\n",
         )
         .unwrap();
+
+        let adapter = DieselAdapter;
+        let path = Utf8Path::from_path(&sql_file).unwrap();
+        let meta = adapter.extract_migration_metadata(path);
+        assert!(meta.run_in_transaction);
+    }
+
+    #[test]
+    fn test_extract_metadata_oversized_toml_defaults_to_in_transaction() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let sql_file = temp_dir.path().join("up.sql");
+        std::fs::write(&sql_file, "SELECT 1;").unwrap();
+        std::fs::write(
+            temp_dir.path().join("metadata.toml"),
+            "x".repeat(usize::try_from(MAX_METADATA_BYTES).unwrap() + 1),
+        )
+        .unwrap();
+
+        let adapter = DieselAdapter;
+        let path = Utf8Path::from_path(&sql_file).unwrap();
+        let meta = adapter.extract_migration_metadata(path);
+        assert!(meta.run_in_transaction);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_metadata_symlink_defaults_to_in_transaction() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let sql_file = temp_dir.path().join("up.sql");
+        let target = temp_dir.path().join("target.toml");
+        let link = temp_dir.path().join("metadata.toml");
+        std::fs::write(&sql_file, "SELECT 1;").unwrap();
+        std::fs::write(&target, "run_in_transaction = false").unwrap();
+        symlink(&target, &link).unwrap();
 
         let adapter = DieselAdapter;
         let path = Utf8Path::from_path(&sql_file).unwrap();

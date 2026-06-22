@@ -80,6 +80,9 @@ diesel-guard init   # creates diesel-guard.toml
 diesel-guard check  # checks ./migrations/ by default
 ```
 
+For editor diagnostics, run the built-in LSP server with `diesel-guard lsp`.
+Helix and Zed setup notes are in [docs/src/editor-integration.md](docs/src/editor-integration.md).
+
 When it finds an unsafe migration:
 
 ```

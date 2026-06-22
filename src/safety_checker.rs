@@ -6,8 +6,11 @@ use crate::error::Result;
 use crate::parser;
 use crate::scripting;
 use camino::Utf8Path;
-use std::fs;
 use std::io::{self, BufRead, BufReader};
+
+pub fn read_sql_file_to_string(path: &Utf8Path) -> Result<String> {
+    Ok(std::fs::read_to_string(path)?)
+}
 
 pub struct SafetyChecker {
     registry: Registry,
@@ -16,23 +19,36 @@ pub struct SafetyChecker {
 }
 
 impl SafetyChecker {
-    /// Create with specific configuration (useful for testing)
+    /// Create with specific configuration (useful for testing).
     ///
     /// # Errors
     ///
-    /// Returns [`crate::config::ConfigError::InvalidCheckName`] if any name in `enable_checks`,
-    /// `disable_checks`, or `warn_checks` is not a known check name (built-in or
-    /// custom script stem from `custom_checks_dir`).
+    /// Returns [`crate::config::ConfigError::InvalidCheckName`] if any name in
+    /// `enable_checks`, `disable_checks`, or `warn_checks` is not a known check
+    /// name (built-in or custom script stem from `custom_checks_dir`).
     pub fn with_config(config: Config) -> std::result::Result<Self, crate::config::ConfigError> {
+        let (checker, warnings) = Self::with_config_and_warnings(config)?;
+        for warning in warnings {
+            eprintln!("Warning: {warning}");
+        }
+        Ok(checker)
+    }
+
+    /// Create with specific configuration and collect non-fatal warnings.
+    ///
+    /// Existing CLI callers should keep using `with_config`; the LSP path uses
+    /// this constructor to surface warning text as protocol messages.
+    pub fn with_config_and_warnings(
+        config: Config,
+    ) -> std::result::Result<(Self, Vec<String>), crate::config::ConfigError> {
+        let mut warnings = Vec::new();
         let mut registry = Registry::with_config(&config);
 
         if let Some(ref dir) = config.custom_checks_dir {
             let dir = Utf8Path::new(dir);
             if dir.exists() {
                 let (checks, errors) = scripting::load_custom_checks(dir, &config);
-                for err in errors {
-                    eprintln!("Warning: {err}");
-                }
+                warnings.extend(errors.into_iter().map(|err| err.to_string()));
                 for check in checks {
                     registry.add_check(check);
                 }
@@ -44,27 +60,10 @@ impl SafetyChecker {
         let custom_names: Vec<String> = config
             .custom_checks_dir
             .as_deref()
-            .and_then(|d| {
-                let dir = Utf8Path::new(d);
-                if dir.exists() {
-                    std::fs::read_dir(dir).ok()
-                } else {
-                    None
-                }
-            })
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("rhai") {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(std::string::ToString::to_string)
-                } else {
-                    None
-                }
-            })
-            .collect();
+            .map(Utf8Path::new)
+            .filter(|dir| dir.exists())
+            .map(scripting::custom_check_names)
+            .unwrap_or_default();
         let known_check_names = builtin_names
             .iter()
             .map(|name| (*name).to_string())
@@ -86,11 +85,14 @@ impl SafetyChecker {
         validate_names(&config.enable_checks)?;
         validate_names(&config.warn_checks)?;
 
-        Ok(Self {
-            registry,
-            config,
-            known_check_names,
-        })
+        Ok((
+            Self {
+                registry,
+                config,
+                known_check_names,
+            },
+            warnings,
+        ))
     }
 
     /// Expose the registry for introspection (e.g. list-checks, explain).
@@ -110,7 +112,12 @@ impl SafetyChecker {
         }
     }
 
-    fn warn_unknown_migration_disabled_checks(&self, disabled_checks: &[String], source: &str) {
+    fn report_unknown_migration_disabled_checks(
+        &self,
+        disabled_checks: &[String],
+        source: &str,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
         let mut warned_names = Vec::new();
 
         for name in disabled_checks {
@@ -125,11 +132,86 @@ impl SafetyChecker {
                 .iter()
                 .any(|known| known.as_str() == name)
             {
-                eprintln!(
-                    "Warning: Unknown check name '{name}' in {source}. Run --list-checks to see available checks."
-                );
+                warnings.push(format!(
+                    "Unknown check name '{name}' in {source}. Run `diesel-guard list-checks` to see available checks."
+                ));
             }
         }
+
+        warnings
+    }
+
+    fn warn_unknown_migration_disabled_checks(&self, disabled_checks: &[String], source: &str) {
+        for warning in self.report_unknown_migration_disabled_checks(disabled_checks, source) {
+            eprintln!("Warning: {warning}");
+        }
+    }
+
+    /// Check SQL string for violations and collect non-fatal warnings.
+    pub fn check_sql_with_warnings(&self, sql: &str) -> Result<(ViolationList, Vec<String>)> {
+        let parsed = parser::parse_with_metadata(sql)?;
+        Ok(self.parsed_sql_with_context_and_warnings(
+            &parsed,
+            &MigrationContext::default(),
+            "migration-scoped disable_checks",
+        ))
+    }
+
+    /// Check a single migration file and collect non-fatal warnings.
+    pub fn check_file_with_warnings(
+        &self,
+        path: &Utf8Path,
+    ) -> Result<(ViolationList, Vec<String>)> {
+        let sql = read_sql_file_to_string(path)?;
+        self.check_file_sql_with_warnings(path, &sql)
+    }
+
+    /// Check SQL from a migration file snapshot and collect non-fatal warnings.
+    pub fn check_file_sql_with_warnings(
+        &self,
+        path: &Utf8Path,
+        sql: &str,
+    ) -> Result<(ViolationList, Vec<String>)> {
+        let ctx = self.migration_metadata_for_sql_snapshot(path, sql);
+
+        match parser::parse_with_metadata(sql) {
+            Ok(parsed) => Ok(self.parsed_sql_with_context_and_warnings(
+                &parsed,
+                &ctx,
+                &format!("{path} migration-scoped disable_checks"),
+            )),
+            Err(e) => Err(e.with_file_context(path.as_str(), sql.to_string())),
+        }
+    }
+
+    fn migration_metadata_for_sql_snapshot(&self, path: &Utf8Path, sql: &str) -> MigrationContext {
+        match self.config.framework.as_str() {
+            "sqlx" => SqlxAdapter::extract_migration_metadata_from_sql(sql),
+            "diesel" => DieselAdapter.extract_migration_metadata(path),
+            _ => self
+                .adapter()
+                .map(|a| a.extract_migration_metadata(path))
+                .unwrap_or_default(),
+        }
+    }
+
+    fn parsed_sql_with_context_and_warnings(
+        &self,
+        parsed: &parser::ParsedSql,
+        ctx: &MigrationContext,
+        warning_source: &str,
+    ) -> (ViolationList, Vec<String>) {
+        let ctx = ctx.with_disabled_checks(&parsed.disabled_checks);
+        let warnings =
+            self.report_unknown_migration_disabled_checks(&ctx.disabled_checks, warning_source);
+        let violations = self.registry.check_stmts_with_context(
+            &parsed.stmts,
+            &parsed.sql,
+            &parsed.ignore_ranges,
+            &self.config,
+            &ctx,
+        );
+        (violations, warnings)
     }
 
     /// Check SQL string for violations
@@ -151,12 +233,9 @@ impl SafetyChecker {
 
     /// Check a single migration file
     pub fn check_file(&self, path: &Utf8Path) -> Result<ViolationList> {
-        let sql = fs::read_to_string(path)?;
+        let sql = read_sql_file_to_string(path)?;
 
-        let ctx = self
-            .adapter()
-            .map(|a| a.extract_migration_metadata(path))
-            .unwrap_or_default();
+        let ctx = self.migration_metadata_for_sql_snapshot(path, &sql);
 
         match parser::parse_with_metadata(&sql) {
             Ok(parsed) => {
@@ -198,9 +277,9 @@ impl SafetyChecker {
         let mut results = Vec::new();
 
         for mig_file in migration_files {
-            let sql = fs::read_to_string(&mig_file.path)?;
+            let sql = read_sql_file_to_string(&mig_file.path)?;
 
-            let ctx = adapter.extract_migration_metadata(&mig_file.path);
+            let ctx = self.migration_metadata_for_sql_snapshot(&mig_file.path, &sql);
 
             match parser::parse_with_metadata(&sql) {
                 Ok(parsed) => {
@@ -782,5 +861,21 @@ mod tests {
         let sql =
             "-- diesel-guard:disable FakeCheckThatDoesNotExist\nALTER TABLE t ADD COLUMN x TEXT;";
         let _ = checker.check_sql(sql).unwrap();
+    }
+
+    #[test]
+    fn test_unknown_configured_check_returns_invalid_check_error() {
+        let result = SafetyChecker::with_config_and_warnings(Config {
+            disable_checks: vec!["FakeCheckThatDoesNotExist".to_string()],
+            ..Config::default()
+        });
+        let Err(err) = result else {
+            panic!("expected invalid check name error");
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid check name: FakeCheckThatDoesNotExist"
+        );
     }
 }

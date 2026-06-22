@@ -76,8 +76,14 @@ impl MigrationAdapter for SqlxAdapter {
             };
         };
 
+        Self::extract_migration_metadata_from_sql(&content)
+    }
+}
+
+impl SqlxAdapter {
+    pub fn extract_migration_metadata_from_sql(sql: &str) -> MigrationContext {
         // Scan every line for `-- no-transaction` (case-insensitive, trimmed)
-        let has_no_transaction = content
+        let has_no_transaction = sql
             .lines()
             .any(|line| line.trim().eq_ignore_ascii_case("-- no-transaction"));
 
@@ -87,9 +93,6 @@ impl MigrationAdapter for SqlxAdapter {
             ..MigrationContext::default()
         }
     }
-}
-
-impl SqlxAdapter {
     /// Process a migration file (formats 1 or 2).
     fn process_migration_file(
         &self,
