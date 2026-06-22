@@ -108,7 +108,7 @@ Available fields:
 The hint is framework-specific:
 
 - **Diesel:** `"Add run_in_transaction = false to the migration's metadata.toml."`
-- **SQLx:** `"Add -- no-transaction as the first line of the migration file."`
+- **SQLx:** `"Add -- no-transaction at the top of the migration file."`
 - **`check_sql` / no framework:** empty string — provide your own fallback.
 
 ## Using `dump-ast`

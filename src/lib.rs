@@ -19,7 +19,6 @@ pub mod ast_dump;
 pub mod checks;
 pub mod config;
 pub mod error;
-mod file_read;
 pub mod formatters;
 pub mod lsp;
 pub mod parser;

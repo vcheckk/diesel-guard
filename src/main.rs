@@ -204,7 +204,7 @@ fn run_explain(check_name: &str, format: Format) -> Result<()> {
         .find(|c| c.name() == check_name)
     else {
         eprintln!("Error: No check named '{check_name}'.");
-        eprintln!("Run `diesel-guard list-checks` to see available checks.");
+        eprintln!("Run --list-checks to see available checks.");
         exit(1);
     };
     print!("{}", format.formatter().format_explain(check, &config));

@@ -775,24 +775,6 @@ fn config_loading_from_workspace_normalizes_custom_checks_dir() {
 }
 
 #[test]
-fn lsp_config_loader_rejects_oversized_config() {
-    let root = temp_root();
-    std::fs::write(
-        root.path().join("diesel-guard.toml"),
-        format!(
-            "framework = \"diesel\"\n# {}\n",
-            "x".repeat(usize::try_from(MAX_CONFIG_BYTES).unwrap())
-        ),
-    )
-    .unwrap();
-    let root_path = Utf8Path::from_path(root.path()).unwrap();
-
-    let err = load_lsp_config(root_path).unwrap_err();
-
-    assert!(matches!(err, ConfigError::ConfigTooLarge { .. }));
-}
-
-#[test]
 fn live_diesel_diagnostics_use_metadata_toml() {
     let root = temp_root();
     let migration_dir = root.path().join("2024_01_01_000000_add_idx");
@@ -848,36 +830,6 @@ fn live_sqlx_diagnostics_use_in_memory_no_transaction_directive() {
 
     assert_eq!(output.diagnostics.len(), 1);
     assert!(output.diagnostics[0].diagnostics.is_empty());
-}
-
-#[test]
-fn live_sqlx_diagnostics_reject_misplaced_no_transaction_directive() {
-    let root = temp_root();
-    std::fs::write(
-        root.path().join("diesel-guard.toml"),
-        "framework = \"sqlx\"\nenable_checks = [\"AddIndexCheck\"]\n",
-    )
-    .unwrap();
-    let sql_path = root.path().join("20240101000000_add_idx.sql");
-    let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
-    let mut state = ServerState::new(root);
-
-    let output = state.handle_open(DidOpenTextDocumentParams {
-        text_document: TextDocumentItem {
-            uri: uri(&format!("file://{}", sql_path.display())),
-            language_id: "sql".to_string(),
-            version: 1,
-            text: "-- ordinary comment before directive\n-- no-transaction\nCREATE INDEX CONCURRENTLY idx_users_email ON users(email);".to_string(),
-        },
-    });
-
-    assert_eq!(output.diagnostics.len(), 1);
-    assert_eq!(output.diagnostics[0].diagnostics.len(), 1);
-    assert!(
-        output.diagnostics[0].diagnostics[0]
-            .message
-            .contains("inside a transaction")
-    );
 }
 
 #[test]
@@ -1254,33 +1206,6 @@ fn saved_file_reader_enforces_limit_during_read() {
     let result = read_file_to_string_with_limit(path, MAX_SAVED_DOCUMENT_BYTES).unwrap();
 
     assert!(matches!(result, LimitedFileRead::TooLarge));
-}
-
-#[test]
-fn saved_file_reader_rejects_non_regular_path() {
-    let root = temp_root();
-    let path = root.path().join("directory.sql");
-    std::fs::create_dir(&path).unwrap();
-    let path = Utf8Path::from_path(&path).unwrap();
-
-    let err = read_file_to_string_with_limit(path, MAX_SAVED_DOCUMENT_BYTES).unwrap_err();
-
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-}
-
-#[cfg(unix)]
-#[test]
-fn saved_file_reader_rejects_symlinked_sql_file() {
-    let root = temp_root();
-    let target = root.path().join("target.txt");
-    let link = root.path().join("linked.sql");
-    std::fs::write(&target, "SELECT 1;").unwrap();
-    std::os::unix::fs::symlink(&target, &link).unwrap();
-    let path = Utf8Path::from_path(&link).unwrap();
-
-    let err = read_file_to_string_with_limit(path, MAX_SAVED_DOCUMENT_BYTES).unwrap_err();
-
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[test]

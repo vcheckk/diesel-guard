@@ -370,7 +370,6 @@ dependencies = [
  "colored",
  "derive_more",
  "human-panic",
- "libc",
  "lsp-server",
  "lsp-types",
  "miette",
