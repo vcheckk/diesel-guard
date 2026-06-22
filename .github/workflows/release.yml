@@ -335,8 +335,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - name: Verify package metadata
-        run: cargo package --package diesel-guard --no-verify
+      - name: Verify package
+        run: cargo package --package diesel-guard
       - name: Publish to crates.io
         run: cargo publish --package diesel-guard
         env:
