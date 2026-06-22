@@ -2,6 +2,7 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use diesel_guard::ast_dump;
 use diesel_guard::formatters::{Formatter, GithubFormatter, JsonFormatter, TextFormatter};
+use diesel_guard::safety_checker::read_sql_file_to_string;
 use diesel_guard::violation::Severity;
 use diesel_guard::{Config, SafetyChecker};
 use miette::{IntoDiagnostic, Result};
@@ -136,6 +137,12 @@ EXAMPLES:
         file: Option<Utf8PathBuf>,
     },
 
+    /// Run the stdio Language Server Protocol server
+    #[command(
+        long_about = "Run a stdio Language Server Protocol server for SQL migration diagnostics."
+    )]
+    Lsp,
+
     /// List all available checks
     ListChecks {
         /// Output format (default: text)
@@ -228,8 +235,7 @@ fn main() -> Result<()> {
         Commands::DumpAst { sql, file } => {
             let sql_input = match (sql, file) {
                 (Some(s), _) => s,
-                (None, Some(path)) => fs::read_to_string(&path)
-                    .into_diagnostic()
+                (None, Some(path)) => read_sql_file_to_string(&path)
                     .map_err(|e| miette::miette!("Failed to read file '{}': {}", path, e))?,
                 (None, None) => unreachable!(),
             };
@@ -268,6 +274,10 @@ fn main() -> Result<()> {
             );
             println!("2. Customize other configuration options as needed");
             println!("3. Run 'diesel-guard check' to check your migrations");
+        }
+
+        Commands::Lsp => {
+            diesel_guard::lsp::run()?;
         }
     }
 
