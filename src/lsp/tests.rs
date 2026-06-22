@@ -775,6 +775,24 @@ fn config_loading_from_workspace_normalizes_custom_checks_dir() {
 }
 
 #[test]
+fn lsp_config_loader_rejects_oversized_config() {
+    let root = temp_root();
+    std::fs::write(
+        root.path().join("diesel-guard.toml"),
+        format!(
+            "framework = \"diesel\"\n# {}\n",
+            "x".repeat(usize::try_from(MAX_CONFIG_BYTES).unwrap())
+        ),
+    )
+    .unwrap();
+    let root_path = Utf8Path::from_path(root.path()).unwrap();
+
+    let err = load_lsp_config(root_path).unwrap_err();
+
+    assert!(matches!(err, ConfigError::ConfigTooLarge { .. }));
+}
+
+#[test]
 fn live_diesel_diagnostics_use_metadata_toml() {
     let root = temp_root();
     let migration_dir = root.path().join("2024_01_01_000000_add_idx");
@@ -1150,6 +1168,41 @@ fn custom_check_warnings_are_collected_for_lsp() {
 }
 
 #[test]
+fn repeated_check_warnings_are_logged_once() {
+    let root = temp_root();
+    let root = Utf8Path::from_path(root.path()).unwrap().to_path_buf();
+    let mut state = ServerState::new(root);
+    let uri = uri("file:///tmp/repeated-warning.sql");
+    let first_sql = "-- diesel-guard:disable FakeCheckThatDoesNotExist\nSELECT 1;";
+    let second_sql = "-- diesel-guard:disable FakeCheckThatDoesNotExist\nSELECT 2;";
+
+    let first = state.handle_open(DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: uri.clone(),
+            language_id: "sql".to_string(),
+            version: 1,
+            text: first_sql.to_string(),
+        },
+    });
+    let second = state.handle_change(DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier { uri, version: 2 },
+        content_changes: vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: second_sql.to_string(),
+        }],
+    });
+
+    assert_eq!(first.messages.len(), 1);
+    assert!(
+        first.messages[0]
+            .message
+            .contains("FakeCheckThatDoesNotExist")
+    );
+    assert!(second.messages.is_empty());
+}
+
+#[test]
 fn small_custom_check_signature_changes_when_same_length_content_changes() {
     let root = temp_root();
     let checks = root.path().join("checks");
@@ -1206,6 +1259,33 @@ fn saved_file_reader_enforces_limit_during_read() {
     let result = read_file_to_string_with_limit(path, MAX_SAVED_DOCUMENT_BYTES).unwrap();
 
     assert!(matches!(result, LimitedFileRead::TooLarge));
+}
+
+#[test]
+fn saved_file_reader_rejects_non_regular_path() {
+    let root = temp_root();
+    let path = root.path().join("directory.sql");
+    std::fs::create_dir(&path).unwrap();
+    let path = Utf8Path::from_path(&path).unwrap();
+
+    let err = read_file_to_string_with_limit(path, MAX_SAVED_DOCUMENT_BYTES).unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_file_reader_rejects_symlinked_sql_file() {
+    let root = temp_root();
+    let target = root.path().join("target.txt");
+    let link = root.path().join("linked.sql");
+    std::fs::write(&target, "SELECT 1;").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let path = Utf8Path::from_path(&link).unwrap();
+
+    let err = read_file_to_string_with_limit(path, MAX_SAVED_DOCUMENT_BYTES).unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[test]

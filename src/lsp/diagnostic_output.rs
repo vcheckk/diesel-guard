@@ -68,7 +68,7 @@ impl ServerState {
         violations: &ViolationList,
         check_warnings: Vec<String>,
     ) {
-        output.push_messages(check_warnings);
+        self.push_new_warning_messages(output, check_warnings);
         output
             .diagnostics
             .extend(self.violations_events(uri, text, violations, version));

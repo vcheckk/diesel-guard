@@ -40,6 +40,9 @@ pub enum ConfigError {
 
     #[error("Custom checks directory is too large for LSP diagnostics: {message}")]
     CustomChecksTooLarge { message: String },
+
+    #[error("Config file is larger than {max_bytes} bytes: {path}")]
+    ConfigTooLarge { path: String, max_bytes: u64 },
 }
 
 impl Diagnostic for ConfigError {
@@ -61,6 +64,7 @@ impl Diagnostic for ConfigError {
             Self::CustomChecksTooLarge { .. } => {
                 Some(Box::new("diesel_guard::config::custom_checks_too_large"))
             }
+            Self::ConfigTooLarge { .. } => Some(Box::new("diesel_guard::config::too_large")),
         }
     }
 
@@ -79,6 +83,9 @@ impl Diagnostic for ConfigError {
             )),
             Self::CustomChecksTooLarge { .. } => Some(Box::new(
                 "Reduce the number or total size of Rhai custom checks used by the editor LSP.",
+            )),
+            Self::ConfigTooLarge { .. } => Some(Box::new(
+                "Reduce diesel-guard.toml to a normal project configuration file size.",
             )),
             _ => None,
         }
@@ -153,7 +160,7 @@ impl Config {
         Self::load_from_str(&contents)
     }
 
-    fn load_from_str(contents: &str) -> Result<Self, ConfigError> {
+    pub(crate) fn load_from_str(contents: &str) -> Result<Self, ConfigError> {
         let config: Config = toml::from_str(contents).map_err(|e| {
             // Check if the error is due to missing framework field
             if e.to_string().contains("missing field `framework`") {

@@ -51,6 +51,7 @@ const MAX_LIVE_DOCUMENT_BYTES: usize = 1_000_000;
 const MAX_SAVED_DOCUMENT_BYTES: u64 = 1_000_000;
 const MAX_TRACKED_DOCUMENTS: usize = 256;
 const MAX_PUBLISHED_DIAGNOSTIC_URIS: usize = 256;
+const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_LSP_CUSTOM_CHECK_FILES: usize = 16;
 const MAX_LSP_CUSTOM_CHECK_TOTAL_SOURCE_BYTES: u64 = 256 * 1024;
 
@@ -86,11 +87,6 @@ impl HandlerOutput {
             messages: Vec::new(),
         }
     }
-
-    fn push_messages(&mut self, warnings: Vec<String>) {
-        self.messages
-            .extend(warnings.into_iter().map(log_message_event));
-    }
 }
 
 pub struct ServerState {
@@ -100,6 +96,7 @@ pub struct ServerState {
     published_sql_uri_order: VecDeque<Uri>,
     checker_cache: Option<CheckerCache>,
     last_config_error_message: Option<String>,
+    emitted_warning_messages: HashSet<String>,
     warned_incremental_change: bool,
     warned_unsupported_notification: bool,
     shutdown_requested: bool,
@@ -120,6 +117,7 @@ impl ServerState {
             published_sql_uri_order: VecDeque::new(),
             checker_cache: None,
             last_config_error_message: None,
+            emitted_warning_messages: HashSet::new(),
             warned_incremental_change: false,
             warned_unsupported_notification: false,
             shutdown_requested: false,
@@ -128,6 +126,16 @@ impl ServerState {
 
     pub fn document(&self, uri: &Uri) -> Option<&DocumentState> {
         self.documents.get(uri)
+    }
+
+    fn push_new_warning_messages(&mut self, output: &mut HandlerOutput, warnings: Vec<String>) {
+        output
+            .messages
+            .extend(warnings.into_iter().filter_map(|warning| {
+                self.emitted_warning_messages
+                    .insert(warning.clone())
+                    .then(|| log_message_event(warning))
+            }));
     }
 
     pub fn handle_open(&mut self, params: DidOpenTextDocumentParams) -> HandlerOutput {
@@ -340,7 +348,7 @@ impl ServerState {
     ) -> std::result::Result<(Arc<SafetyChecker>, HandlerOutput), HandlerOutput> {
         match self.load_checker() {
             Ok((checker, warnings)) => {
-                output.push_messages(warnings);
+                self.push_new_warning_messages(&mut output, warnings);
                 Ok((checker, output))
             }
             Err(err) => Err(self.config_error_output(uri, version, &err)),
